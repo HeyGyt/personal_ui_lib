@@ -421,58 +421,48 @@ local Library = {
         return Library.ScreenScale -- cached, no descendant scan
     end
 
-    Library.MakeDraggable = function(Self, Handle)
-        if not Self.Instance then
+ Library.MakeDraggable = function(Self)
+    if not Self.Instance then
+        return
+    end
+
+    local Gui = Self.Instance
+    local Dragging = false
+    local DragStart
+    local StartPosition
+
+    Self:Connect("InputBegan", function(Input)
+        if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+            Dragging = true
+            DragStart = Input.Position
+            StartPosition = Gui.Position -- keep scale + anchor as-is
+
+            local InputChanged
+            InputChanged = Input.Changed:Connect(function()
+                if Input.UserInputState == Enum.UserInputState.End then
+                    Dragging = false
+                    InputChanged:Disconnect()
+                end
+            end)
+        end
+    end)
+
+    Library:Connect(UserInputService.InputChanged, function(Input)
+        if not Dragging then
             return
         end
 
-        local Gui = Self.Instance
-        local Dragging = false
-        local DragStart
-        local StartPosition
+        if Input.UserInputType == Enum.UserInputType.MouseMovement or Input.UserInputType == Enum.UserInputType.Touch then
+            local Scale = Library:GetScreenScale()
+            local DragDelta = (Input.Position - DragStart) / Scale
 
-        (Handle or Self):Connect("InputBegan", function(Input)
-            if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
-                Dragging = true
-                DragStart = Input.Position
-
-                -- normalize to offset coords (fixes the keybind-list jump: scale + 0.5 anchor were discarded before)
-                local Scale = Library:GetScreenScale()
-                local Absolute = Gui.AbsolutePosition / Scale
-
-                Gui.AnchorPoint = Vector2New(0, 0)
-                Gui.Position = UDim2FromOffset(Absolute.X, Absolute.Y)
-                StartPosition = Absolute
-
-                local InputChanged
-                InputChanged = Input.Changed:Connect(function()
-                    if Input.UserInputState == Enum.UserInputState.End then
-                        Dragging = false
-                        InputChanged:Disconnect()
-                    end
-                end)
-            end
-        end)
-
-        Library:Connect(UserInputService.InputChanged, function(Input)
-            if not Dragging then
-                return
-            end
-
-            if Input.UserInputType == Enum.UserInputType.MouseMovement or Input.UserInputType == Enum.UserInputType.Touch then
-                local Scale = Library:GetScreenScale()
-                local DragDelta = (Input.Position - DragStart) / Scale
-
-                local ParentSize = Gui.Parent.AbsoluteSize / Scale
-                local GuiSize = Gui.AbsoluteSize / Scale
-
-                local NewX = MathClamp(StartPosition.X + DragDelta.X, 0, ParentSize.X - GuiSize.X)
-                local NewY = MathClamp(StartPosition.Y + DragDelta.Y, 0, ParentSize.Y - GuiSize.Y)
-
-                Gui.Position = UDim2FromOffset(NewX, NewY) -- direct write, no tween lag
-            end
-        end)
-    end
+            Gui.Position = UDim2New(
+                StartPosition.X.Scale,  StartPosition.X.Offset + DragDelta.X,
+                StartPosition.Y.Scale,  StartPosition.Y.Offset + DragDelta.Y
+            )
+        end
+    end)
+end
 
     Library.MakeResizeable = function(Self, Minimum)
         if not Self.Instance then
@@ -2616,7 +2606,6 @@ local Library = {
                     Parent = Items["Background"].Instance,
                     Size = UDim2New(1, 0, 0, 2),
                     Position = UDim2New(0, 0, 0, 30),
-                    ZIndex = 2,
                     BorderSizePixel = 0,
                     BackgroundColor3 = Library.Theme["Accent"]
                 }):AddToTheme({BackgroundColor3 = 'Accent'})
