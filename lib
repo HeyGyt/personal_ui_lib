@@ -1,0 +1,933 @@
+--[[
+	NovaUI - lightweight Roblox UI library
+	Docs: see NovaUI_Docs.md
+]]
+
+local genv = (getgenv and getgenv()) or _G
+if genv.NovaLib then pcall(function() genv.NovaLib:Unload() end) end
+
+local cloneref = cloneref or function(x) return x end
+local Players      = cloneref(game:GetService("Players"))
+local UIS          = cloneref(game:GetService("UserInputService"))
+local RunService   = cloneref(game:GetService("RunService"))
+local TweenService = cloneref(game:GetService("TweenService"))
+local HttpService  = cloneref(game:GetService("HttpService"))
+local CoreGui      = cloneref(game:GetService("CoreGui"))
+
+local AutoX, AutoY, AutoXY = Enum.AutomaticSize.X, Enum.AutomaticSize.Y, Enum.AutomaticSize.XY
+
+--------------------------------------------------------------------------------
+-- Core
+--------------------------------------------------------------------------------
+local Lib = {
+	Flags = {},          -- Lib.Flags["Name"] -> current value of every element
+	Options = {},        -- Lib.Options["Name"] -> the element object
+	Folder = "NovaUI",   -- config folder
+	ToggleKey = Enum.KeyCode.RightShift,
+	Font = Enum.Font.Code,
+	TextSize = 13,
+	Scale = (UIS.TouchEnabled and not UIS.KeyboardEnabled) and 0.75 or 1,
+	Theme = {
+		Background = Color3.fromRGB(12, 12, 12),
+		Inline     = Color3.fromRGB(19, 19, 19),
+		Outline    = Color3.fromRGB(51, 51, 51),
+		Border     = Color3.fromRGB(3, 3, 3),
+		Accent     = Color3.fromRGB(176, 176, 209),
+		Text       = Color3.fromRGB(208, 207, 227),
+		Dim        = Color3.fromRGB(134, 134, 134),
+		Element    = Color3.fromRGB(39, 39, 39),
+		Hover      = Color3.fromRGB(61, 61, 61),
+	},
+	_binds = {},
+	_windows = {},
+}
+genv.NovaLib = Lib
+
+local conns = {}
+local themed = setmetatable({}, { __mode = "k" })
+local drag -- active drag/slide callback (only one at a time)
+
+local function Connect(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(conns, c)
+	return c
+end
+
+local function Call(fn, ...)
+	if type(fn) == "function" then
+		local ok, err = pcall(fn, ...)
+		if not ok then warn("[NovaUI] callback error: " .. tostring(err)) end
+	end
+end
+
+local TEXT = { TextLabel = true, TextButton = true, TextBox = true }
+
+local function Bind(o, prop, key)
+	local t = themed[o]
+	if not t then t = {}; themed[o] = t end
+	t[prop] = key
+	o[prop] = Lib.Theme[key]
+end
+
+local function New(class, props, theme)
+	local o = Instance.new(class)
+	if class == "Frame" or class == "ScrollingFrame" or TEXT[class] then o.BorderSizePixel = 0 end
+	if class == "ScrollingFrame" then o.BackgroundTransparency = 1 end
+	if TEXT[class] then
+		o.Font, o.TextSize, o.TextXAlignment, o.Text = Lib.Font, Lib.TextSize, Enum.TextXAlignment.Left, ""
+		if class == "TextLabel" then o.BackgroundTransparency = 1 end
+		if class == "TextButton" then o.AutoButtonColor = false end
+	end
+	for k, v in props do
+		if k ~= "Parent" then o[k] = v end
+	end
+	if theme then
+		for p, key in theme do Bind(o, p, key) end
+	end
+	o.Parent = props.Parent
+	return o
+end
+
+local function Stroke(o, key)
+	return New("UIStroke", {
+		Parent = o,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		LineJoinMode = Enum.LineJoinMode.Miter,
+	}, { Color = key or "Outline" })
+end
+
+local function Pad(o, t, r, b, l)
+	return New("UIPadding", {
+		Parent = o,
+		PaddingTop = UDim.new(0, t or 0), PaddingRight = UDim.new(0, r or 0),
+		PaddingBottom = UDim.new(0, b or 0), PaddingLeft = UDim.new(0, l or 0),
+	})
+end
+
+local function Layout(o, pad, horizontal, center)
+	return New("UIListLayout", {
+		Parent = o,
+		Padding = UDim.new(0, pad or 0),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		FillDirection = horizontal and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+		VerticalAlignment = center and Enum.VerticalAlignment.Center or Enum.VerticalAlignment.Top,
+	})
+end
+
+local function Tween(o, props, t)
+	pcall(function()
+		TweenService:Create(o, TweenInfo.new(t or 0.12), props):Play()
+	end)
+end
+
+local function IsPress(i)
+	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+end
+local function IsMove(i)
+	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
+end
+
+local function GetParent()
+	local ok, p = pcall(function() return (gethui and gethui()) or CoreGui end)
+	if ok and p then return p end
+	return Players.LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- IgnoreGuiInset = false keeps AbsolutePosition and Input.Position in the same
+-- coordinate space (fixes the "UI jumps above the cursor" drag bug).
+Lib.Holder = New("ScreenGui", {
+	Parent = GetParent(), Name = "NovaUI", ResetOnSpawn = false,
+	IgnoreGuiInset = false, DisplayOrder = 999,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+New("UIScale", { Parent = Lib.Holder, Scale = Lib.Scale })
+
+-- Dragging: converts the frame to a plain top-left offset position on grab, so
+-- anchor points / scale positions can never make it snap.
+local function Draggable(handle, target)
+	handle.InputBegan:Connect(function(i)
+		if not IsPress(i) then return end
+		local scale = Lib.Scale
+		local startMouse = Vector2.new(i.Position.X, i.Position.Y)
+		local startPos = target.AbsolutePosition / scale
+		target.AnchorPoint = Vector2.zero
+		target.Position = UDim2.fromOffset(startPos.X, startPos.Y)
+		drag = function(m)
+			local p = startPos + (Vector2.new(m.Position.X, m.Position.Y) - startMouse) / scale
+			local vp = Lib.Holder.AbsoluteSize / scale
+			local sz = target.AbsoluteSize / scale
+			target.Position = UDim2.fromOffset(
+				math.clamp(p.X, 0, math.max(vp.X - sz.X, 0)),
+				math.clamp(p.Y, 0, math.max(vp.Y - sz.Y, 0))
+			)
+		end
+	end)
+end
+
+-- Slidable: fn(x, y) with x/y in 0..1 relative to obj while the mouse is held
+local function Slidable(obj, fn)
+	local function upd(i)
+		local p, s = obj.AbsolutePosition, obj.AbsoluteSize
+		fn(math.clamp((i.Position.X - p.X) / s.X, 0, 1), math.clamp((i.Position.Y - p.Y) / s.Y, 0, 1))
+	end
+	obj.InputBegan:Connect(function(i)
+		if IsPress(i) then drag = upd; upd(i) end
+	end)
+end
+
+local function Register(obj, flag, o)
+	obj.Flag = flag
+	obj.NoSave = o.NoSave
+	Lib.Options[flag] = obj
+end
+
+--------------------------------------------------------------------------------
+-- Theme / misc API
+--------------------------------------------------------------------------------
+function Lib:SetTheme(key, color)
+	if type(key) == "table" then
+		for k, v in key do Lib:SetTheme(k, v) end
+		return
+	end
+	if not Lib.Theme[key] then return end
+	Lib.Theme[key] = color
+	for o, props in themed do
+		for p, k in props do
+			if k == key then o[p] = color end
+		end
+	end
+end
+
+function Lib:Unload()
+	for _, c in conns do pcall(function() c:Disconnect() end) end
+	table.clear(conns)
+	if Lib.Holder then Lib.Holder:Destroy() end
+	if genv.NovaLib == Lib then genv.NovaLib = nil end
+end
+
+function Lib:Notify(text, duration, color)
+	if not Lib._nholder then
+		Lib._nholder = New("Frame", { Parent = Lib.Holder, BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 10), Size = UDim2.fromOffset(320, 300) })
+		Layout(Lib._nholder, 6)
+	end
+	local n = New("Frame", { Parent = Lib._nholder, Size = UDim2.fromOffset(0, 22), AutomaticSize = AutoX, BackgroundTransparency = 1 }, { BackgroundColor3 = "Inline" })
+	local s = Stroke(n, "Outline"); s.Transparency = 1
+	local bar = New("Frame", { Parent = n, Size = UDim2.new(0, 2, 1, 0), BackgroundColor3 = color or Lib.Theme.Accent, BackgroundTransparency = 1 })
+	local t = New("TextLabel", { Parent = n, Position = UDim2.fromOffset(2, 0), Size = UDim2.new(0, 0, 1, 0), AutomaticSize = AutoX, Text = tostring(text), TextTransparency = 1 }, { TextColor3 = "Text" })
+	Pad(t, 0, 8, 0, 8)
+	local function fade(a)
+		Tween(n, { BackgroundTransparency = a }, 0.2); Tween(s, { Transparency = a }, 0.2)
+		Tween(bar, { BackgroundTransparency = a }, 0.2); Tween(t, { TextTransparency = a }, 0.2)
+	end
+	fade(0)
+	task.delay(duration or 4, function()
+		fade(1); task.wait(0.25)
+		pcall(function() n:Destroy() end)
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- Config system
+--------------------------------------------------------------------------------
+local FS = writefile and readfile and isfile and isfolder and makefolder and listfiles and delfile
+local function cfgDir() return Lib.Folder .. "/Configs" end
+local function cfgPath(name) return cfgDir() .. "/" .. name .. ".json" end
+local function ensure()
+	if not isfolder(Lib.Folder) then makefolder(Lib.Folder) end
+	if not isfolder(cfgDir()) then makefolder(cfgDir()) end
+end
+
+function Lib:Export()
+	local d = {}
+	for flag, opt in Lib.Options do
+		if opt.Export and not opt.NoSave then d[flag] = opt:Export() end
+	end
+	return d
+end
+
+function Lib:Import(d)
+	for flag, v in d do
+		local opt = Lib.Options[flag]
+		if opt and opt.Import then pcall(opt.Import, opt, v) end
+	end
+end
+
+function Lib:SaveConfig(name)
+	if not FS then return false, "executor has no file functions" end
+	ensure()
+	return pcall(writefile, cfgPath(name), HttpService:JSONEncode(Lib:Export()))
+end
+
+function Lib:LoadConfig(name)
+	if not FS then return false, "executor has no file functions" end
+	ensure()
+	if not isfile(cfgPath(name)) then return false, "config does not exist" end
+	local ok, data = pcall(function() return HttpService:JSONDecode(readfile(cfgPath(name))) end)
+	if not ok then return false, "invalid config file" end
+	Lib:Import(data)
+	return true
+end
+
+function Lib:DeleteConfig(name)
+	if not FS then return false, "executor has no file functions" end
+	ensure()
+	if isfile(cfgPath(name)) then delfile(cfgPath(name)) return true end
+	return false, "config does not exist"
+end
+
+function Lib:GetConfigs()
+	local out = {}
+	if not FS then return out end
+	ensure()
+	for _, path in listfiles(cfgDir()) do
+		local n = path:match("([^/\\]+)%.json$")
+		if n then table.insert(out, n) end
+	end
+	return out
+end
+
+--------------------------------------------------------------------------------
+-- Keybinds (one global input handler for every keybind)
+--------------------------------------------------------------------------------
+Lib._RefreshBinds = function() end
+
+local function ParseKey(s)
+	if typeof(s) == "EnumItem" then return s end
+	if type(s) ~= "string" then return nil end
+	local t, n = s:match("^(%w+)%.(%w+)$")
+	if not t then
+		local ok, k = pcall(function() return Enum.KeyCode[s] end)
+		return ok and k or nil
+	end
+	local ok, k = pcall(function() return Enum[t][n] end)
+	return ok and k or nil
+end
+
+local Modes = { "Toggle", "Hold", "Always" }
+
+local function MakeKeybind(sub, name, o, a)
+	if type(o) ~= "table" then o = { Default = o, Callback = a } end
+	local K = {
+		Name = o.Name or name, Mode = o.Mode or "Toggle", Key = nil, Active = false, Binding = false,
+		ShowInList = o.ShowInList ~= false,
+	}
+	local flag = o.Flag or (name .. " Key")
+
+	local btn = New("TextButton", { Parent = sub, Size = UDim2.new(0, 0, 0, 14), AutomaticSize = AutoX, Text = "none" },
+		{ BackgroundColor3 = "Element", TextColor3 = "Dim" })
+	Stroke(btn, "Border")
+	Pad(btn, 0, 5, 0, 5)
+
+	local function refreshText()
+		local t = K.Binding and "..." or (K.Key and K.Key.Name:lower() or "none")
+		if not K.Binding and K.Mode ~= "Toggle" and K.Mode ~= "None" then t ..= " (" .. K.Mode:lower() .. ")" end
+		btn.Text = t
+	end
+
+	function K:SetActive(v)
+		if K.Active == v then return end
+		K.Active = v
+		Lib.Flags[flag] = v
+		Call(o.Callback, v)
+		Lib._RefreshBinds()
+	end
+	function K:SetKey(key)
+		K.Key = ParseKey(key)
+		if K.Key == Enum.KeyCode.Unknown then K.Key = nil end
+		refreshText()
+		Call(o.Changed, K.Key)
+		Lib._RefreshBinds()
+	end
+	function K:SetMode(m)
+		K.Mode = m
+		if m == "Always" then K:SetActive(true) elseif K.Active then K:SetActive(false) end
+		refreshText()
+	end
+	function K:Get() return K.Active end
+	function K:Export()
+		return { Key = K.Key and (tostring(K.Key.EnumType) .. "." .. K.Key.Name) or nil, Mode = K.Mode }
+	end
+	function K:Import(d)
+		if type(d) ~= "table" then return end
+		K:SetMode(d.Mode or "Toggle")
+		K:SetKey(d.Key)
+	end
+
+	btn.MouseButton1Click:Connect(function()
+		if Lib._picking == K then
+			K.Binding = false; Lib._picking = nil
+		else
+			if Lib._picking then Lib._picking.Binding = false; Lib._picking:SetKey(Lib._picking.Key) end
+			K.Binding = true; Lib._picking = K
+		end
+		refreshText()
+	end)
+	btn.MouseButton2Click:Connect(function() -- right click: cycle mode
+		if K.Mode == "None" then return end
+		local idx = table.find(Modes, K.Mode) or 1
+		K:SetMode(Modes[idx % #Modes + 1])
+		Lib:Notify(K.Name .. " mode: " .. K.Mode, 2)
+	end)
+
+	Register(K, flag, o)
+	Lib.Flags[flag] = false
+	table.insert(Lib._binds, K)
+	K:SetMode(K.Mode)
+	if o.Default then K:SetKey(o.Default) end
+	return K
+end
+
+Connect(UIS.InputBegan, function(i, gpe)
+	-- picking a new key
+	local picker = Lib._picking
+	if picker then
+		local key
+		if i.UserInputType == Enum.UserInputType.Keyboard then
+			key = i.KeyCode
+			if key == Enum.KeyCode.Escape or key == Enum.KeyCode.Backspace then key = nil end
+		elseif i.UserInputType == Enum.UserInputType.MouseButton2 or i.UserInputType == Enum.UserInputType.MouseButton3 then
+			key = i.UserInputType
+		else
+			return
+		end
+		Lib._picking = nil
+		picker.Binding = false
+		picker:SetKey(key)
+		return
+	end
+
+	local keyboard = i.UserInputType == Enum.UserInputType.Keyboard
+	if keyboard then
+		if UIS:GetFocusedTextBox() then return end
+		if i.KeyCode == Lib.ToggleKey then
+			for _, w in Lib._windows do w:Toggle() end
+		end
+	else
+		if i.UserInputType == Lib.ToggleKey then
+			for _, w in Lib._windows do w:Toggle() end
+		end
+		if gpe then return end -- clicking on UI shouldn't fire mouse binds
+	end
+
+	for _, K in Lib._binds do
+		local key = K.Key
+		if key and (K.Mode == "Toggle" or K.Mode == "Hold") and (i.KeyCode == key or i.UserInputType == key) then
+			if K.Mode == "Toggle" then K:SetActive(not K.Active) else K:SetActive(true) end
+		end
+	end
+end)
+
+Connect(UIS.InputEnded, function(i)
+	if IsPress(i) then drag = nil end
+	for _, K in Lib._binds do
+		if K.Mode == "Hold" and K.Key and (i.KeyCode == K.Key or i.UserInputType == K.Key) then
+			K:SetActive(false)
+		end
+	end
+end)
+
+Connect(UIS.InputChanged, function(i)
+	if drag and IsMove(i) then drag(i) end
+end)
+
+--------------------------------------------------------------------------------
+-- Colorpicker (inline, expands under its row)
+--------------------------------------------------------------------------------
+local function MakeColorpicker(sec, row, sub, name, o, a)
+	if type(o) ~= "table" then o = { Default = o, Callback = a } end
+	local C = { H = 0, S = 0, V = 1, Value = Color3.new(1, 1, 1) }
+	local flag = o.Flag or (name .. " Color")
+
+	local sw = New("TextButton", { Parent = sub, Size = UDim2.fromOffset(22, 10) })
+	Stroke(sw, "Border")
+
+	local pop = New("Frame", { Parent = sec.Content, Size = UDim2.new(1, 0, 0, 100), Visible = false, LayoutOrder = row.LayoutOrder + 1 }, { BackgroundColor3 = "Background" })
+	Stroke(pop, "Outline")
+
+	local pal = New("Frame", { Parent = pop, Position = UDim2.fromOffset(6, 6), Size = UDim2.new(1, -36, 1, -12) })
+	Stroke(pal, "Border")
+	local white = New("Frame", { Parent = pal, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1) })
+	New("UIGradient", { Parent = white, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) }) })
+	local black = New("Frame", { Parent = pal, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0) })
+	New("UIGradient", { Parent = black, Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }) })
+	local cursor = New("Frame", { Parent = pal, AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(5, 5), BackgroundColor3 = Color3.new(1, 1, 1) })
+	Stroke(cursor, "Border")
+
+	local hue = New("Frame", { Parent = pop, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -6, 0, 6), Size = UDim2.new(0, 16, 1, -12), BackgroundColor3 = Color3.new(1, 1, 1) })
+	Stroke(hue, "Border")
+	local seq = {}
+	for n = 0, 6 do table.insert(seq, ColorSequenceKeypoint.new(n / 6, Color3.fromHSV((n % 6) / 6, 1, 1))) end
+	New("UIGradient", { Parent = hue, Rotation = 90, Color = ColorSequence.new(seq) })
+	local hmark = New("Frame", { Parent = hue, Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = Color3.new(1, 1, 1) })
+	Stroke(hmark, "Border")
+
+	local function refresh(fire)
+		C.Value = Color3.fromHSV(C.H, C.S, C.V)
+		sw.BackgroundColor3 = C.Value
+		pal.BackgroundColor3 = Color3.fromHSV(C.H, 1, 1)
+		cursor.Position = UDim2.fromScale(C.S, 1 - C.V)
+		hmark.Position = UDim2.new(0, 0, math.min(C.H, 0.98), -1)
+		Lib.Flags[flag] = C.Value
+		if fire then Call(o.Callback, C.Value) end
+	end
+
+	function C:Set(c, silent)
+		if type(c) == "string" then
+			local ok, r = pcall(Color3.fromHex, c)
+			if not ok then return end
+			c = r
+		end
+		if typeof(c) ~= "Color3" then return end
+		C.H, C.S, C.V = c:ToHSV()
+		refresh(not silent)
+	end
+	function C:Get() return C.Value end
+	function C:Export() return "#" .. C.Value:ToHex() end
+	function C:Import(d) C:Set(d) end
+
+	Slidable(pal, function(x, y) C.S = x; C.V = 1 - y; refresh(true) end)
+	Slidable(hue, function(_, y) C.H = y; refresh(true) end)
+	sw.MouseButton1Click:Connect(function() pop.Visible = not pop.Visible end)
+
+	Register(C, flag, o)
+	C:Set(o.Default or Color3.new(1, 1, 1))
+	return C
+end
+
+--------------------------------------------------------------------------------
+-- Sections & elements
+--------------------------------------------------------------------------------
+local Window, Tab, Section = {}, {}, {}
+Window.__index, Tab.__index, Section.__index = Window, Tab, Section
+
+function Section:_next()
+	self.Order += 10
+	return self.Order
+end
+
+-- adds :Keybind() / :Colorpicker() to Toggles and Labels
+local function Subs(obj, sec, row, name)
+	local sub
+	local function holder()
+		if not sub then
+			sub = New("Frame", { Parent = row, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0, 0, 1, 0), AutomaticSize = AutoX })
+			Layout(sub, 6, true, true)
+		end
+		return sub
+	end
+	function obj:Keybind(o, a) return MakeKeybind(holder(), name, o, a) end
+	function obj:Colorpicker(o, a) return MakeColorpicker(sec, row, holder(), name, o, a) end
+	return obj
+end
+
+function Section:Label(o)
+	if type(o) ~= "table" then o = { Name = o } end
+	local name = o.Name or "Label"
+	local L = {}
+	local row = New("Frame", { Parent = self.Content, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14), LayoutOrder = self:_next() })
+	local lbl = New("TextLabel", { Parent = row, Size = UDim2.new(1, 0, 1, 0), Text = name }, { TextColor3 = "Text" })
+	function L:Set(t) lbl.Text = tostring(t) end
+	function L:SetVisible(b) row.Visible = b end
+	return Subs(L, self, row, name)
+end
+
+function Section:Toggle(o, default, cb)
+	if type(o) ~= "table" then o = { Name = o, Default = default, Callback = cb } end
+	local name = o.Name or "Toggle"
+	local T = { Value = false }
+	local row = New("TextButton", { Parent = self.Content, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16), LayoutOrder = self:_next() })
+	local box = New("Frame", { Parent = row, Position = UDim2.new(0, 1, 0.5, -5), Size = UDim2.fromOffset(10, 10) }, { BackgroundColor3 = "Element" })
+	Stroke(box, "Border")
+	local lbl = New("TextLabel", { Parent = row, Position = UDim2.fromOffset(20, 0), Size = UDim2.new(1, -20, 1, 0), Text = name }, { TextColor3 = "Text" })
+
+	function T:Set(v, silent)
+		v = v and true or false
+		local changed = T.Value ~= v
+		T.Value = v
+		Lib.Flags[T.Flag] = v
+		Bind(box, "BackgroundColor3", v and "Accent" or "Element")
+		if not silent and (changed or T._first) then Call(o.Callback, v) end
+		T._first = false
+	end
+	function T:Get() return T.Value end
+	function T:SetText(t) lbl.Text = tostring(t) end
+	function T:SetVisible(b) row.Visible = b end
+	function T:Export() return T.Value end
+	function T:Import(v) T:Set(v) end
+
+	row.MouseButton1Click:Connect(function() T:Set(not T.Value) end)
+	row.MouseEnter:Connect(function() if not T.Value then box.BackgroundColor3 = Lib.Theme.Hover end end)
+	row.MouseLeave:Connect(function() if not T.Value then box.BackgroundColor3 = Lib.Theme.Element end end)
+
+	Register(T, o.Flag or name, o)
+	T._first = true
+	T:Set(o.Default)
+	return Subs(T, self, row, name)
+end
+
+function Section:Button(o, cb)
+	if type(o) ~= "table" then o = { Name = o, Callback = cb } end
+	local B = {}
+	local b = New("TextButton", { Parent = self.Content, Size = UDim2.new(1, 0, 0, 20), Text = o.Name or "Button", TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = self:_next() },
+		{ BackgroundColor3 = "Element", TextColor3 = "Text" })
+	Stroke(b, "Border")
+	function B:Fire()
+		b.BackgroundColor3 = Lib.Theme.Accent
+		Tween(b, { BackgroundColor3 = Lib.Theme.Element }, 0.25)
+		Call(o.Callback)
+	end
+	function B:SetText(t) b.Text = tostring(t) end
+	function B:SetVisible(v) b.Visible = v end
+	b.MouseButton1Click:Connect(function() B:Fire() end)
+	b.MouseEnter:Connect(function() Tween(b, { BackgroundColor3 = Lib.Theme.Hover }) end)
+	b.MouseLeave:Connect(function() Tween(b, { BackgroundColor3 = Lib.Theme.Element }) end)
+	return B
+end
+
+function Section:Slider(o, min, max, default, cb)
+	if type(o) ~= "table" then o = { Name = o, Min = min, Max = max, Default = default, Callback = cb } end
+	local name = o.Name or "Slider"
+	local S = { Min = o.Min or 0, Max = o.Max or 100, Inc = o.Increment or 1, Suffix = o.Suffix or "" }
+	local wrap = New("Frame", { Parent = self.Content, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = self:_next() })
+	local lbl = New("TextLabel", { Parent = wrap, Size = UDim2.new(1, 0, 0, 14), Text = name }, { TextColor3 = "Text" })
+	local val = New("TextLabel", { Parent = wrap, Size = UDim2.new(1, 0, 0, 14), TextXAlignment = Enum.TextXAlignment.Right }, { TextColor3 = "Dim" })
+	local bar = New("Frame", { Parent = wrap, Position = UDim2.fromOffset(0, 18), Size = UDim2.new(1, 0, 0, 8) }, { BackgroundColor3 = "Element" })
+	Stroke(bar, "Border")
+	local fill = New("Frame", { Parent = bar, Size = UDim2.new(0, 0, 1, 0) }, { BackgroundColor3 = "Accent" })
+
+	function S:Set(v, silent)
+		v = math.clamp(tonumber(v) or S.Min, S.Min, S.Max)
+		v = math.floor((v - S.Min) / S.Inc + 0.5) * S.Inc + S.Min
+		v = math.clamp(tonumber(string.format("%.4f", v)), S.Min, S.Max)
+		local old = S.Value
+		S.Value = v
+		Lib.Flags[S.Flag] = v
+		fill.Size = UDim2.new((v - S.Min) / math.max(S.Max - S.Min, 1e-9), 0, 1, 0)
+		val.Text = tostring(v) .. S.Suffix
+		if not silent and old ~= v then Call(o.Callback, v) end
+	end
+	function S:Get() return S.Value end
+	function S:SetText(t) lbl.Text = tostring(t) end
+	function S:SetVisible(b) wrap.Visible = b end
+	function S:Export() return S.Value end
+	function S:Import(v) S:Set(v) end
+
+	Slidable(bar, function(x) S:Set(S.Min + (S.Max - S.Min) * x) end)
+	Register(S, o.Flag or name, o)
+	S:Set(o.Default or S.Min)
+	return S
+end
+
+function Section:Dropdown(o, items, default, cb)
+	if type(o) ~= "table" then o = { Name = o, Items = items, Default = default, Callback = cb } end
+	local name = o.Name or "Dropdown"
+	local D = { Multi = o.Multi and true or false, Value = o.Multi and {} or nil, _btns = {} }
+
+	local wrap = New("Frame", { Parent = self.Content, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AutoY, LayoutOrder = self:_next() })
+	Layout(wrap, 3)
+	New("TextLabel", { Parent = wrap, Size = UDim2.new(1, 0, 0, 14), Text = name, LayoutOrder = 1 }, { TextColor3 = "Text" })
+	local btn = New("TextButton", { Parent = wrap, Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 2 }, { BackgroundColor3 = "Element" })
+	Stroke(btn, "Border")
+	local val = New("TextLabel", { Parent = btn, Position = UDim2.fromOffset(5, 0), Size = UDim2.new(1, -22, 1, 0), Text = "none", TextTruncate = Enum.TextTruncate.AtEnd }, { TextColor3 = "Text" })
+	local arrow = New("TextLabel", { Parent = btn, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -5, 0, 0), Size = UDim2.new(0, 10, 1, 0), Text = "+", TextXAlignment = Enum.TextXAlignment.Right }, { TextColor3 = "Accent" })
+	local list = New("ScrollingFrame", { Parent = wrap, Size = UDim2.new(1, 0, 0, 0), Visible = false, LayoutOrder = 3, BackgroundTransparency = 0, ScrollBarThickness = 2, AutomaticCanvasSize = AutoY, CanvasSize = UDim2.new() },
+		{ BackgroundColor3 = "Element", ScrollBarImageColor3 = "Accent" })
+	Stroke(list, "Border")
+	Layout(list, 0)
+
+	local function render()
+		for n, b in D._btns do
+			local sel
+			if D.Multi then sel = table.find(D.Value, n) ~= nil else sel = D.Value == n end
+			Bind(b, "TextColor3", sel and "Accent" or "Dim")
+		end
+		if D.Multi then
+			val.Text = #D.Value > 0 and table.concat(D.Value, ", ") or "none"
+		else
+			val.Text = D.Value or "none"
+		end
+	end
+
+	function D:Set(v, silent)
+		if D.Multi then
+			local new = {}
+			if type(v) == "table" then
+				for _, n in v do
+					if D._btns[n] and not table.find(new, n) then table.insert(new, n) end
+				end
+			end
+			D.Value = new
+		else
+			if v ~= nil and not D._btns[v] then return end
+			D.Value = v
+		end
+		Lib.Flags[D.Flag] = D.Value
+		render()
+		if not silent then Call(o.Callback, D.Value) end
+	end
+
+	function D:Refresh(newItems)
+		for _, b in D._btns do b:Destroy() end
+		D._btns = {}
+		local count = 0
+		for idx, n in newItems do
+			n = tostring(n)
+			count += 1
+			local b = New("TextButton", { Parent = list, Size = UDim2.new(1, 0, 0, 16), Text = n, LayoutOrder = idx }, { TextColor3 = "Dim" })
+			Pad(b, 0, 0, 0, 5)
+			D._btns[n] = b
+			b.MouseButton1Click:Connect(function()
+				if D.Multi then
+					local copy = table.clone(D.Value)
+					local at = table.find(copy, n)
+					if at then table.remove(copy, at) else table.insert(copy, n) end
+					D:Set(copy)
+				else
+					D:Set(n)
+					list.Visible = false
+					arrow.Text = "+"
+				end
+			end)
+		end
+		list.Size = UDim2.new(1, 0, 0, math.min(count, 7) * 16)
+		-- drop values that no longer exist
+		if D.Multi then D:Set(D.Value, true)
+		elseif D.Value and not D._btns[D.Value] then D.Value = nil; Lib.Flags[D.Flag] = nil end
+		render()
+	end
+	function D:Get() return D.Value end
+	function D:SetText(t) wrap:FindFirstChildWhichIsA("TextLabel").Text = tostring(t) end
+	function D:SetVisible(b) wrap.Visible = b end
+	function D:Export() return D.Value end
+	function D:Import(v) D:Set(v) end
+
+	btn.MouseButton1Click:Connect(function()
+		list.Visible = not list.Visible
+		arrow.Text = list.Visible and "-" or "+"
+	end)
+
+	Register(D, o.Flag or name, o)
+	D:Refresh(o.Items or {})
+	if o.Default ~= nil then D:Set(o.Default) else Lib.Flags[D.Flag] = D.Value end
+	return D
+end
+
+function Section:Textbox(o, default, cb)
+	if type(o) ~= "table" then o = { Name = o, Default = default, Callback = cb } end
+	local name = o.Name or "Textbox"
+	local X = { Value = "" }
+	local wrap = New("Frame", { Parent = self.Content, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 38), LayoutOrder = self:_next() })
+	local lbl = New("TextLabel", { Parent = wrap, Size = UDim2.new(1, 0, 0, 14), Text = name }, { TextColor3 = "Text" })
+	local box = New("TextBox", { Parent = wrap, Position = UDim2.fromOffset(0, 17), Size = UDim2.new(1, 0, 0, 20), PlaceholderText = o.Placeholder or "", ClearTextOnFocus = false, ClipsDescendants = true },
+		{ BackgroundColor3 = "Element", TextColor3 = "Text", PlaceholderColor3 = "Dim" })
+	Stroke(box, "Border")
+	Pad(box, 0, 5, 0, 5)
+
+	local function value(t) if o.Numeric then return tonumber(t) end return t end
+
+	function X:Set(v, silent)
+		v = v == nil and "" or tostring(v)
+		if o.Numeric and v ~= "" and not tonumber(v) then return end
+		X.Value = value(v) or ""
+		box.Text = v
+		Lib.Flags[X.Flag] = X.Value
+		if not silent then Call(o.Callback, X.Value) end
+	end
+	function X:Get() return X.Value end
+	function X:SetText(t) lbl.Text = tostring(t) end
+	function X:SetVisible(b) wrap.Visible = b end
+	function X:Export() return X.Value end
+	function X:Import(v) X:Set(v) end
+
+	if o.Live then
+		box:GetPropertyChangedSignal("Text"):Connect(function()
+			if o.Numeric and box.Text ~= "" and not tonumber(box.Text) then box.Text = tostring(X.Value); return end
+			X.Value = value(box.Text) or ""
+			Lib.Flags[X.Flag] = X.Value
+			Call(o.Callback, X.Value)
+		end)
+	else
+		box.FocusLost:Connect(function()
+			if o.Numeric and box.Text ~= "" and not tonumber(box.Text) then box.Text = tostring(X.Value); return end
+			X:Set(box.Text)
+		end)
+	end
+
+	Register(X, o.Flag or name, o)
+	X:Set(o.Default or "", true)
+	return X
+end
+
+-- standalone label + keybind / colorpicker rows
+function Section:Keybind(o, default, cb)
+	if type(o) ~= "table" then o = { Name = o, Default = default, Callback = cb } end
+	o.Flag = o.Flag or o.Name
+	return self:Label(o.Name or "Keybind"):Keybind(o)
+end
+
+function Section:Colorpicker(o, default, cb)
+	if type(o) ~= "table" then o = { Name = o, Default = default, Callback = cb } end
+	o.Flag = o.Flag or o.Name
+	return self:Label(o.Name or "Color"):Colorpicker(o)
+end
+
+--------------------------------------------------------------------------------
+-- Tabs / Window
+--------------------------------------------------------------------------------
+function Tab:Section(name, side)
+	local right = side == 2 or (type(side) == "string" and side:lower() == "right")
+	local col = right and self.Right or self.Left
+	local f = New("Frame", { Parent = col, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AutoY }, { BackgroundColor3 = "Inline" })
+	Stroke(f, "Outline")
+	New("TextLabel", { Parent = f, Position = UDim2.fromOffset(8, 3), Size = UDim2.new(1, -16, 0, 16), Text = name or "Section" }, { TextColor3 = "Accent" })
+	New("Frame", { Parent = f, Position = UDim2.fromOffset(0, 21), Size = UDim2.new(1, 0, 0, 1) }, { BackgroundColor3 = "Outline" })
+	local content = New("Frame", { Parent = f, BackgroundTransparency = 1, Position = UDim2.fromOffset(8, 29), Size = UDim2.new(1, -16, 0, 0), AutomaticSize = AutoY })
+	Layout(content, 6)
+	Pad(content, 0, 0, 8, 0)
+	return setmetatable({ Content = content, Order = 0, Tab = self }, Section)
+end
+
+function Tab:Select()
+	local w = self.Window
+	if w.Current then
+		w.Current.Page.Visible = false
+		Bind(w.Current.Button, "TextColor3", "Dim")
+	end
+	w.Current = self
+	self.Page.Visible = true
+	Bind(self.Button, "TextColor3", "Accent")
+end
+
+function Window:Tab(name)
+	local t = setmetatable({ Window = self }, Tab)
+	t.Page = New("Frame", { Parent = self._content, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false })
+	local function column(pos)
+		local c = New("ScrollingFrame", { Parent = t.Page, Position = pos, Size = UDim2.new(0.5, -12, 1, 0), ScrollBarThickness = 2, AutomaticCanvasSize = AutoY, CanvasSize = UDim2.new() },
+			{ ScrollBarImageColor3 = "Accent" })
+		Layout(c, 12)
+		Pad(c, 10, 3, 8, 3)
+		return c
+	end
+	t.Left = column(UDim2.fromOffset(8, 0))
+	t.Right = column(UDim2.new(0.5, 4, 0, 0))
+	t.Button = New("TextButton", { Parent = self._tabs, Size = UDim2.new(0, 0, 1, 0), AutomaticSize = AutoX, Text = name or "Tab" }, { TextColor3 = "Dim" })
+	t.Button.MouseButton1Click:Connect(function() t:Select() end)
+	if not self.Current then t:Select() end
+	return t
+end
+
+function Window:Toggle() self.Main.Visible = not self.Main.Visible end
+function Window:SetVisible(b) self.Main.Visible = b end
+
+function Window:SettingsTab(name)
+	local tab = self:Tab(name or "Settings")
+
+	local menu = tab:Section("Menu", 1)
+	menu:Keybind({ Name = "Menu key", Flag = "_MenuKey", Default = Lib.ToggleKey, Mode = "None",
+		Changed = function(k) if k then Lib.ToggleKey = k end end })
+	menu:Toggle({ Name = "Watermark", Flag = "_Watermark", Default = true, Callback = function(v) if Lib._watermark then Lib._watermark:SetVisible(v) end end })
+	menu:Toggle({ Name = "Keybind list", Flag = "_KeybindList", Default = true, Callback = function(v) if Lib._klist then Lib._klist:SetVisible(v) end end })
+	menu:Button("Unload UI", function() Lib:Unload() end)
+
+	local cf = tab:Section("Configs", 1)
+	local nameBox = cf:Textbox({ Name = "Config name", Flag = "_CfgName", NoSave = true, Placeholder = "my config" })
+	local dd = cf:Dropdown({ Name = "Configs", Flag = "_CfgList", NoSave = true, Items = Lib:GetConfigs() })
+	local function pick()
+		local n = nameBox.Value
+		if n == "" or n == nil then n = dd.Value end
+		return n
+	end
+	local function result(ok, err, okMsg)
+		Lib:Notify(ok and okMsg or ("Failed: " .. tostring(err)), 3, ok and nil or Color3.fromRGB(255, 70, 70))
+		dd:Refresh(Lib:GetConfigs())
+	end
+	cf:Button("Save", function() local n = pick() if n then local ok, err = Lib:SaveConfig(n) result(ok, err, "Saved " .. n) end end)
+	cf:Button("Load", function() local n = pick() if n then local ok, err = Lib:LoadConfig(n) result(ok, err, "Loaded " .. n) end end)
+	cf:Button("Delete", function() local n = pick() if n then local ok, err = Lib:DeleteConfig(n) result(ok, err, "Deleted " .. n) end end)
+
+	local th = tab:Section("Theme", 2)
+	for _, k in { "Accent", "Background", "Inline", "Outline", "Border", "Text", "Dim", "Element", "Hover" } do
+		th:Colorpicker({ Name = k, Flag = "Theme_" .. k, Default = Lib.Theme[k], Callback = function(c) Lib:SetTheme(k, c) end })
+	end
+	return tab
+end
+
+function Lib:Window(o)
+	if type(o) ~= "table" then o = { Title = o } end
+	local w = setmetatable({}, Window)
+	if o.ToggleKey then Lib.ToggleKey = o.ToggleKey end
+
+	local main = New("Frame", { Parent = Lib.Holder, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(o.Width or 540, o.Height or 380) }, { BackgroundColor3 = "Background" })
+	Stroke(main, "Outline")
+	local bar = New("Frame", { Parent = main, Size = UDim2.new(1, 0, 0, 28) }, { BackgroundColor3 = "Inline" })
+	New("TextLabel", { Parent = bar, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0, 0, 1, 0), AutomaticSize = AutoX, Text = o.Title or "Window" }, { TextColor3 = "Accent" })
+	New("Frame", { Parent = main, Position = UDim2.fromOffset(0, 28), Size = UDim2.new(1, 0, 0, 1) }, { BackgroundColor3 = "Accent" })
+	local tabs = New("Frame", { Parent = bar, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 0), Size = UDim2.new(0, 0, 1, 0), AutomaticSize = AutoX })
+	Layout(tabs, 12, true, true)
+	local content = New("Frame", { Parent = main, BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 29), Size = UDim2.new(1, 0, 1, -29), ClipsDescendants = true })
+	Draggable(bar, main)
+
+	w.Main, w._tabs, w._content = main, tabs, content
+	table.insert(Lib._windows, w)
+	return w
+end
+
+--------------------------------------------------------------------------------
+-- Watermark & keybind list
+--------------------------------------------------------------------------------
+function Lib:Watermark(text)
+	local W = {}
+	local template = tostring(text or "NovaUI | {fps} fps")
+	local f = New("Frame", { Parent = Lib.Holder, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 10), Size = UDim2.new(0, 0, 0, 22), AutomaticSize = AutoX }, { BackgroundColor3 = "Background" })
+	Stroke(f, "Outline")
+	New("Frame", { Parent = f, Size = UDim2.new(1, 0, 0, 2) }, { BackgroundColor3 = "Accent" })
+	local lbl = New("TextLabel", { Parent = f, Size = UDim2.new(0, 0, 1, 0), AutomaticSize = AutoX, Text = (template:gsub("{fps}", "--")) }, { TextColor3 = "Text" })
+	Pad(lbl, 2, 8, 0, 8)
+	Draggable(f, f)
+
+	function W:SetText(t) template = tostring(t); lbl.Text = (template:gsub("{fps}", "--")) end
+	function W:SetVisible(b) f.Visible = b end
+
+	local n, t0 = 0, os.clock()
+	Connect(RunService.RenderStepped, function()
+		n += 1
+		local now = os.clock()
+		if now - t0 >= 0.5 then
+			local fps = math.floor(n / (now - t0) + 0.5)
+			n, t0 = 0, now
+			if template:find("{fps}", 1, true) then lbl.Text = (template:gsub("{fps}", tostring(fps))) end
+		end
+	end)
+
+	Lib._watermark = W
+	return W
+end
+
+function Lib:KeybindList()
+	local L = { rows = {} }
+	local f = New("Frame", { Parent = Lib.Holder, Position = UDim2.new(0, 10, 0.5, -40), Size = UDim2.new(0, 0, 0, 0), AutomaticSize = AutoXY }, { BackgroundColor3 = "Background" })
+	Stroke(f, "Outline")
+	New("UISizeConstraint", { Parent = f, MinSize = Vector2.new(140, 0) })
+	Layout(f, 2)
+	Pad(f, 4, 8, 6, 8)
+	New("TextLabel", { Parent = f, Size = UDim2.new(0, 0, 0, 16), AutomaticSize = AutoX, Text = "Keybinds", LayoutOrder = 0 }, { TextColor3 = "Accent" })
+	Draggable(f, f)
+
+	Lib._RefreshBinds = function()
+		for _, r in L.rows do r:Destroy() end
+		L.rows = {}
+		for idx, K in Lib._binds do
+			if K.Active and K.ShowInList and K.Mode ~= "None" then
+				local key = K.Key and K.Key.Name or "-"
+				table.insert(L.rows, New("TextLabel", { Parent = f, Size = UDim2.new(0, 0, 0, 14), AutomaticSize = AutoX, Text = K.Name .. " [" .. key .. "] " .. K.Mode, LayoutOrder = idx }, { TextColor3 = "Text" }))
+			end
+		end
+	end
+	function L:SetVisible(b) f.Visible = b end
+
+	Lib._klist = L
+	Lib._RefreshBinds()
+	return L
+end
+
+return Lib
