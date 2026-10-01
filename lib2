@@ -421,7 +421,7 @@ local Library = {
         return Library.ScreenScale -- cached, no descendant scan
     end
 
- Library.MakeDraggable = function(Self)
+ Library.MakeDraggable = function(Self, Handle)
     if not Self.Instance then
         return
     end
@@ -431,7 +431,10 @@ local Library = {
     local DragStart
     local StartPosition
 
-    Self:Connect("InputBegan", function(Input)
+    -- Handle (optional) = wrapper that starts the drag, defaults to the frame itself
+    local HandleObject = Handle or Self
+
+    HandleObject:Connect("InputBegan", function(Input)
         if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
             Dragging = true
             DragStart = Input.Position
@@ -2606,6 +2609,7 @@ end
                     Parent = Items["Background"].Instance,
                     Size = UDim2New(1, 0, 0, 2),
                     Position = UDim2New(0, 0, 0, 30),
+                    ZIndex = 2,
                     BorderSizePixel = 0,
                     BackgroundColor3 = Library.Theme["Accent"]
                 }):AddToTheme({BackgroundColor3 = 'Accent'})
@@ -2685,6 +2689,14 @@ end
                 Items["Outline"]:FadeDescendants(Bool, function()
                     Debounce = false
                 end)
+
+                for Section in Library.FloatingSections do
+                    local Floater = Section.FloatWrapper
+
+                    if Floater then
+                        Floater:FadeDescendants(Bool)
+                    end
+                end
 
                 for _, Value in Library.OpenFrames do
                     Value:SetOpen(false)
@@ -2777,6 +2789,7 @@ end
 
                 Window = Self,
                 ColumnsData = { },
+                SectionOrder = { 0, 0 },
                 Items = { },
                 Active = false,
                 Debounce = false
@@ -2951,6 +2964,369 @@ end
             return setmetatable(Page, Library)
         end
 
+        -- // floating sections: hold the section title and drag it out of the menu, drop it back on its slot to dock
+        Library.FloatingSections = { }
+
+        local FloatInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+        local FloatInsetX, FloatInsetTop = 10, 16 -- wrapper borders + padding around the section
+        local FloatThreshold = 12 -- px of movement before a section pops out
+        local FloatSnapMargin = 24 -- how close to the original column counts as "over the slot"
+
+        local ActiveFloatDrag = nil
+        local FloatDragHooked = false
+
+        local function HookFloatDrag()
+            if FloatDragHooked then
+                return
+            end
+
+            FloatDragHooked = true
+
+            Library:Connect(UserInputService.InputChanged, function(Input)
+                if ActiveFloatDrag and (Input.UserInputType == Enum.UserInputType.MouseMovement or Input.UserInputType == Enum.UserInputType.Touch) then
+                    ActiveFloatDrag.Move()
+                end
+            end)
+
+            Library:Connect(UserInputService.InputEnded, function(Input)
+                if ActiveFloatDrag and (Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch) then
+                    local Drag = ActiveFloatDrag
+                    ActiveFloatDrag = nil
+                    Drag.End()
+                end
+            end)
+        end
+
+        -- floating windows sit one layer above the menu (menu = 1..2, popups = 4+)
+        local function BumpZIndex(Root, Delta)
+            if Root:IsA("GuiObject") then
+                Root.ZIndex += Delta
+            end
+
+            for _, Child in Root:GetDescendants() do
+                if Child:IsA("GuiObject") then
+                    Child.ZIndex += Delta
+                end
+            end
+        end
+
+        Library.MakeSectionFloatable = function(Section)
+            local Items = Section.Items
+            local SectionFrame = Items["Section"].Instance
+            local ColumnInstance = Section.Page.ColumnsData[Section.Side].Instance
+
+            HookFloatDrag()
+
+            Items["FloatHandle"] = Library:Create("TextButton", {
+                Name = "\0",
+                Parent = SectionFrame,
+                Text = "",
+                AutoButtonColor = false,
+                BackgroundTransparency = 1,
+                BorderSizePixel = 0,
+                Position = UDim2New(0, 0, 0, 0),
+                Size = UDim2New(1, 0, 0, 10)
+            })
+
+            local Floating, Pressed, Moved = false, false, false
+            local PressStart = Vector2New(0, 0)
+            local GrabOffset = Vector2New(0, 0)
+            local Wrapper, Placeholder, PlaceStroke, ZConnection
+            local Shadowed = false
+            local Drag = { }
+
+            local function OverSlot(Mouse)
+                local Main = Library.MainWindow
+
+                if Main and Main.Items["Outline"] and not Main.Items["Outline"].Instance.Visible then
+                    return false
+                end
+
+                -- inactive pages live in the unused holder
+                if not ColumnInstance:IsDescendantOf(Library.Holder.Instance) then
+                    return false
+                end
+
+                local Origin, Extent = ColumnInstance.AbsolutePosition, ColumnInstance.AbsoluteSize
+
+                return Mouse.X >= Origin.X - FloatSnapMargin and Mouse.X <= Origin.X + Extent.X + FloatSnapMargin
+                    and Mouse.Y >= Origin.Y - FloatSnapMargin and Mouse.Y <= Origin.Y + Extent.Y + FloatSnapMargin
+            end
+
+            -- the "shadow": the slot opens up in the column exactly where the section will land
+            local function SetShadow(On)
+                if Shadowed == On or not Placeholder then
+                    return
+                end
+
+                Shadowed = On
+
+                local Slot = Placeholder.Instance
+                local Scale = Library:GetScreenScale()
+
+                if On then
+                    Slot.Visible = true
+
+                    Placeholder:Tween({Size = UDim2New(1, 0, 0, SectionFrame.AbsoluteSize.Y / Scale), BackgroundTransparency = 0.85}, FloatInfo)
+                    PlaceStroke:Tween({Transparency = 0.35}, FloatInfo)
+                else
+                    local Closing = Placeholder:Tween({Size = UDim2New(1, 0, 0, 0), BackgroundTransparency = 1}, FloatInfo)
+                    PlaceStroke:Tween({Transparency = 1}, FloatInfo)
+
+                    Closing.Completed:Once(function()
+                        if not Shadowed then
+                            Slot.Visible = false -- hidden items are skipped by the list layout (no leftover gap)
+                        end
+                    end)
+                end
+            end
+
+            local function Dock()
+                if not Floating then
+                    return
+                end
+
+                Floating, Pressed, Shadowed = false, false, false
+
+                Library.FloatingSections[Section] = nil
+                Section.FloatWrapper = nil
+
+                if ZConnection then
+                    ZConnection:Disconnect()
+                    ZConnection = nil
+                end
+
+                BumpZIndex(SectionFrame, -1)
+
+                SectionFrame.Parent = ColumnInstance -- LayoutOrder puts it back on its original slot
+
+                Placeholder.Instance:Destroy()
+                Wrapper.Instance:Destroy()
+                Wrapper, Placeholder, PlaceStroke = nil, nil, nil
+            end
+
+            local BeginPress
+
+            local function PopOut(Mouse)
+                if Floating then
+                    return
+                end
+
+                local Scale = Library:GetScreenScale()
+                local Origin, Extent = SectionFrame.AbsolutePosition, SectionFrame.AbsoluteSize
+
+                for _, Value in Library.OpenFrames do
+                    Value:SetOpen(false)
+                end
+
+                -- placeholder that keeps the slot in the column
+                Placeholder = Library:Create("Frame", {
+                    Name = "\0",
+                    Parent = ColumnInstance,
+                    LayoutOrder = SectionFrame.LayoutOrder,
+                    Visible = false,
+                    Size = UDim2New(1, 0, 0, 0),
+                    BackgroundTransparency = 1,
+                    BorderSizePixel = 0,
+                    BackgroundColor3 = Library.Theme["Accent"]
+                }):AddToTheme({BackgroundColor3 = 'Accent'})
+
+                PlaceStroke = Library:Create("UIStroke", {
+                    Name = "\0",
+                    Parent = Placeholder.Instance,
+                    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+                    LineJoinMode = Enum.LineJoinMode.Miter,
+                    Transparency = 1,
+                    Color = Library.Theme["Accent"]
+                }):AddToTheme({Color = 'Accent'})
+
+                -- floating frame styled like the main window
+                local Inset = Vector2New(FloatInsetX, FloatInsetTop) * Scale
+                local Start = (Origin - Inset) / Scale
+
+                Wrapper = Library:Create("Frame", {
+                    Name = "\0",
+                    Parent = Library.Holder.Instance,
+                    Position = UDim2FromOffset(Start.X, Start.Y),
+                    Size = UDim2New(0, Extent.X / Scale + FloatInsetX * 2, 0, 0),
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    BorderSizePixel = 0,
+                    ZIndex = 2,
+                    BackgroundColor3 = Library.Theme["Border"]
+                }):AddToTheme({BackgroundColor3 = 'Border'})
+
+                Library:Create("UIPadding", {
+                    Name = "\0",
+                    Parent = Wrapper.Instance,
+                    PaddingTop = UDim.new(0, 1),
+                    PaddingBottom = UDim.new(0, 1),
+                    PaddingRight = UDim.new(0, 1),
+                    PaddingLeft = UDim.new(0, 1)
+                })
+
+                local WrapperOutline = Library:Create("Frame", {
+                    Name = "\0",
+                    Parent = Wrapper.Instance,
+                    Size = UDim2New(1, 0, 0, 0),
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    BorderSizePixel = 0,
+                    ZIndex = 2,
+                    BackgroundColor3 = Library.Theme["Outline"]
+                }):AddToTheme({BackgroundColor3 = 'Outline'})
+
+                Library:Create("UIPadding", {
+                    Name = "\0",
+                    Parent = WrapperOutline.Instance,
+                    PaddingTop = UDim.new(0, 1),
+                    PaddingBottom = UDim.new(0, 1),
+                    PaddingRight = UDim.new(0, 1),
+                    PaddingLeft = UDim.new(0, 1)
+                })
+
+                local WrapperBackground = Library:Create("Frame", {
+                    Name = "\0",
+                    Parent = WrapperOutline.Instance,
+                    Size = UDim2New(1, 0, 0, 0),
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    BorderSizePixel = 0,
+                    ZIndex = 2,
+                    BackgroundColor3 = Library.Theme["Background"]
+                }):AddToTheme({BackgroundColor3 = 'Background'})
+
+                Library:Create("UIPadding", {
+                    Name = "\0",
+                    Parent = WrapperBackground.Instance,
+                    PaddingTop = UDim.new(0, 14),
+                    PaddingBottom = UDim.new(0, 8),
+                    PaddingRight = UDim.new(0, 8),
+                    PaddingLeft = UDim.new(0, 8)
+                })
+
+                Library:Create("Frame", {
+                    Name = "\0",
+                    Parent = WrapperBackground.Instance,
+                    Position = UDim2New(0, -8, 0, -14),
+                    Size = UDim2New(1, 16, 0, 2),
+                    ZIndex = 3,
+                    BorderSizePixel = 0,
+                    BackgroundColor3 = Library.Theme["Accent"]
+                }):AddToTheme({BackgroundColor3 = 'Accent'})
+
+                -- drag by the empty top strip of the frame as well as by the section title
+                Wrapper:Connect("InputBegan", function(Input)
+                    if Input.UserInputType ~= Enum.UserInputType.MouseButton1 and Input.UserInputType ~= Enum.UserInputType.Touch then
+                        return
+                    end
+
+                    if UserInputService:GetMouseLocation().Y - Wrapper.Instance.AbsolutePosition.Y <= (FloatInsetTop + 10) * Library:GetScreenScale() then
+                        BeginPress()
+                    end
+                end)
+
+                SectionFrame.Parent = WrapperBackground.Instance
+                SectionFrame.Position = UDim2New(0, 0, 0, 0)
+
+                BumpZIndex(SectionFrame, 1)
+
+                ZConnection = SectionFrame.DescendantAdded:Connect(function(Descendant)
+                    if Descendant:IsA("GuiObject") then
+                        Descendant.ZIndex += 1
+                    end
+                end)
+
+                local Main = Library.MainWindow
+
+                if Main and Main.Items["Outline"] then
+                    Wrapper.Instance.Visible = Main.Items["Outline"].Instance.Visible
+                end
+
+                Floating = true
+                GrabOffset = Mouse - (Origin - Inset)
+
+                Library.FloatingSections[Section] = true
+                Section.FloatWrapper = Wrapper
+            end
+
+            BeginPress = function()
+                Pressed = true
+                Moved = false
+                PressStart = UserInputService:GetMouseLocation()
+                ActiveFloatDrag = Drag
+
+                if Floating then
+                    GrabOffset = PressStart - Wrapper.Instance.AbsolutePosition
+
+                    -- click-to-front
+                    Wrapper.Instance.Parent = nil
+                    Wrapper.Instance.Parent = Library.Holder.Instance
+                end
+            end
+
+            Drag.Move = function()
+                if not Pressed then
+                    return
+                end
+
+                local Mouse = UserInputService:GetMouseLocation()
+
+                if not Floating then
+                    if (Mouse - PressStart).Magnitude < FloatThreshold then
+                        return
+                    end
+
+                    PopOut(Mouse)
+                elseif not Moved and (Mouse - PressStart).Magnitude < 3 then
+                    return
+                end
+
+                Moved = true
+
+                local Scale = Library:GetScreenScale()
+                local Target = (Mouse - GrabOffset) / Scale
+                local Bounds = Library.Holder.Instance.AbsoluteSize / Scale
+                local Size = Wrapper.Instance.AbsoluteSize / Scale
+
+                Wrapper.Instance.Position = UDim2FromOffset(
+                    MathClamp(Target.X, 0, MathMax(Bounds.X - Size.X, 0)),
+                    MathClamp(Target.Y, 0, MathMax(Bounds.Y - 30, 0))
+                )
+
+                SetShadow(OverSlot(Mouse))
+            end
+
+            Drag.End = function()
+                Pressed = false
+
+                if not Floating then
+                    return
+                end
+
+                if Moved and OverSlot(UserInputService:GetMouseLocation()) then
+                    Dock()
+                else
+                    SetShadow(false)
+                end
+            end
+
+            Items["FloatHandle"]:Connect("InputBegan", function(Input)
+                if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+                    BeginPress()
+                end
+            end)
+
+            function Section:IsFloating()
+                return Floating
+            end
+
+            function Section:SetFloating(Bool)
+                if Bool then
+                    PopOut(UserInputService:GetMouseLocation())
+                else
+                    Dock()
+                end
+            end
+        end
+
         Library.Section = function(Self, Params)
             Params = Params or { }
 
@@ -2963,10 +3339,15 @@ end
                 Items = { },
             }
 
+            local PageOrders = Section.Page.SectionOrder
+            PageOrders[Section.Side] = (PageOrders[Section.Side] or 0) + 1
+            Section.Order = PageOrders[Section.Side]
+
             local Items = { } do
                 Items["Section"] = Library:Create("Frame", {
                     Name = "\0",
                     Parent = Section.Page.ColumnsData[Section.Side].Instance,
+                    LayoutOrder = Section.Order,
                     Size = UDim2New(1, 0, 0, 0),
                     BorderSizePixel = 0,
                     AutomaticSize = Enum.AutomaticSize.Y,
@@ -3040,6 +3421,10 @@ end
 
             function Section:SetText(Text)
                 Items["Text"].Instance.Text = tostring(Text)
+            end
+
+            if Params.Floatable ~= false and Params.floatable ~= false then
+                Library.MakeSectionFloatable(Section)
             end
 
             return setmetatable(Section, Library)
