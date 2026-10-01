@@ -513,7 +513,7 @@ end
             StartMouse = UserInputService:GetMouseLocation()
 
             local Scale = Library:GetScreenScale()
-            local Absolute = Gui.AbsolutePosition / Scale
+            local Absolute = Library:ToLocal(Gui.AbsolutePosition) / Scale
 
             Gui.AnchorPoint = Vector2New(0, 0)
             Gui.Position = UDim2FromOffset(Absolute.X, Absolute.Y)
@@ -895,6 +895,20 @@ end
         ZIndexBehavior = Enum.ZIndexBehavior.Global,
         ResetOnSpawn = false
     })
+
+    -- // position-space origin (absolute -> Position conversions go through this)
+    Library.Origin = Library:Create("Frame", {
+        Name = "\0",
+        Parent = Library.Holder.Instance,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2New(0, 0, 0, 0),
+        Size = UDim2New(0, 0, 0, 0)
+    })
+
+    Library.ToLocal = function(Self, Absolute)
+        return Absolute - Library.Origin.Instance.AbsolutePosition
+    end
 
     -- // preset themes
     Library:Thread(function()
@@ -3113,7 +3127,7 @@ end
                 end
 
                 local Scale = Library:GetScreenScale()
-                local Origin, Extent = SectionFrame.AbsolutePosition, SectionFrame.AbsoluteSize
+                local Origin, Extent = Library:ToLocal(SectionFrame.AbsolutePosition), SectionFrame.AbsoluteSize
 
                 for _, Value in Library.OpenFrames do
                     Value:SetOpen(false)
@@ -3254,7 +3268,7 @@ end
                 ActiveFloatDrag = Drag
 
                 if Floating then
-                    GrabOffset = PressStart - Wrapper.Instance.AbsolutePosition
+                    GrabOffset = PressStart - Library:ToLocal(Wrapper.Instance.AbsolutePosition)
 
                     -- click-to-front
                     Wrapper.Instance.Parent = nil
