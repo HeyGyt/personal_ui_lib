@@ -2998,6 +2998,7 @@ do
 						math.floor(Accent.G * 255 + 0.5),
 						math.floor(Accent.B * 255 + 0.5)
 					)
+
 					local Key = (RowKey ~= "" and RowKey ~= "None") and RowKey or "..."
 
 					NewItems["Text"].Instance.Text = string.format(
@@ -4942,31 +4943,6 @@ local IconLabel = Library:Create("ImageLabel", {
 IconLabel:AddToTheme({
     ImageColor3 = "Accent"
 })
-else
-    -- Fallback to the "J" bar drawing code if no image is found
-    local IconBars = {
-        {Position = UDim2.fromOffset(8, 3), Size = UDim2.fromOffset(10, 2), Rotation = 19},
-        {Position = UDim2.fromOffset(8, 12), Size = UDim2.fromOffset(2, 16), Rotation = 0},
-        {Position = UDim2.fromOffset(3, 15), Size = UDim2.fromOffset(2, 8), Rotation = -28},
-        {Position = UDim2.fromOffset(6, 17), Size = UDim2.fromOffset(11, 2), Rotation = 26}
-    }
-
-    for _, Bar in IconBars do
-        local Piece = Library:Create("Frame", {
-            Name = "\0",
-            Parent = Items["Icon"].Instance,
-            AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = Bar.Position,
-            Size = Bar.Size,
-            Rotation = Bar.Rotation,
-            ZIndex = 4,
-            BorderSizePixel = 0,
-            BackgroundColor3 = Library.Theme["Accent"]
-        }):AddToTheme({BackgroundColor3 = 'Accent'})
-
-        Library:AccentGradient(Piece, 90)
-    end
-end
 
 				Items["ActualTitle"] = Library:Create("Frame", {
 					Name = "\0",
@@ -4997,6 +4973,7 @@ end
 					for _, Letter in TitleLetters do
 						Letter.Label.Instance:Destroy()
 					end
+
 					table.clear(TitleLetters)
 
 					Text = tostring(Text)
@@ -5996,6 +5973,7 @@ end
 				GrabOffset = Library:MousePoint() - Vector2.new(Origin.X - FloatPad, Origin.Y - FloatPad - 1)
 
 				Library.FloatingSections[Section] = true
+
 				if WrapperLayer then
 					Library:BringToFront(WrapperLayer)
 				end
