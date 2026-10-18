@@ -380,6 +380,7 @@ do
 			end
 
 			Library.CurrentTheme = Name
+			Library.ActiveTheme = {Kind = "Preset", Name = Name}
 			return true
 		end
 			local CustomFont = { } do
@@ -515,6 +516,18 @@ do
 			return Connection
 		end
 
+		-- colour tweens are remembered per object. a tween that is already running when the theme changes would otherwise
+		-- finish on the OLD theme's colour and the item would keep it until something touched it again
+		Library.TweenLog = setmetatable({ }, {__mode = "k"})
+
+		Library.ColorProperties = {
+			["BackgroundColor3"] = true,
+			["TextColor3"] = true,
+			["ImageColor3"] = true,
+			["Color"] = true,
+			["ScrollBarImageColor3"] = true,
+			["PlaceholderColor3"] = true
+		}
 		Library.Tween = function(Self, Properties, Info, IsRawItem)
 			local Object = Self.Instance or IsRawItem
 			Info = Info or TweenInfo.new(Library.Animation.Time, Enum.EasingStyle[Library.Animation.Style], Enum.EasingDirection[Library.Animation.Direction])
@@ -525,6 +538,37 @@ do
 
 			local NewTween = TweenService:Create(Object, Info, Properties)
 			NewTween:Play()
+
+			local Tracked = false
+
+			for Property in Properties do
+				if Library.ColorProperties[Property] then
+					Tracked = true
+
+					break
+				end
+			end
+
+			if Tracked then
+				local Log = Library.TweenLog[Object]
+
+				if not Log then
+					Log = { }
+					Library.TweenLog[Object] = Log
+				end
+
+				local Running = {Tween = NewTween, Properties = Properties}
+
+				table.insert(Log, Running)
+
+				NewTween.Completed:Once(function()
+					local Position = table.find(Log, Running)
+
+					if Position then
+						table.remove(Log, Position)
+					end
+				end)
+			end
 
 			if Object:IsA("TextLabel") then
 				local Stroke = Object:FindFirstChildOfClass("UIStroke")
@@ -1015,51 +1059,265 @@ do
 			return math.floor(Number * Multiplier + 0.5) / Multiplier
 		end
 
+		-- flags that only drive the settings ui itself, they are never written into a config
+		Library.ConfigExclude = {
+			["configs_dropdown"] = true,
+			["config_name"] = true,
+			["config_autoload"] = true,
+			["themes_dropdown"] = true,
+			["theme_name"] = true,
+			["theme_autoload"] = true
+		}
+
 		Library.GetConfig = function(Self)
 			local Config = { }
 
-			local Success, Result = Library:SafeCall(function()
-				for Index, Value in Library.Flags do
-					if type(Value) == "table" and Value.Key then
-						Config[Index] = {Key = tostring(Value.Key), Mode = Value.Mode}
-					elseif type(Value) == "table" and Value.Color then
-						Config[Index] = {Color = "#" .. Value.HexValue, Alpha = Value.Alpha}
-					else
-						Config[Index] = Value
-					end
+			for Index, Value in Library.Flags do
+				if Library.ConfigExclude[Index] then
+					continue
 				end
-			end)
+
+				local Entry
+
+				if type(Value) == "table" and Value.Key then
+					Entry = {Key = tostring(Value.Key), Mode = Value.Mode}
+				elseif type(Value) == "table" and Value.Color then
+					Entry = {Color = "#" .. tostring(Value.Base or Value.HexValue or Value.Color:ToHex()), Alpha = Value.Alpha, Animate = Value.Animate, Mode = Value.Mode}
+				elseif typeof(Value) == "Color3" then
+					Entry = {Color = "#" .. Value:ToHex(), Alpha = 0}
+				elseif Value ~= nil then
+					Entry = Value
+				end
+
+				-- one flag that cannot be encoded must not take the whole config down with it
+				if Entry ~= nil and pcall(HttpService.JSONEncode, HttpService, Entry) then
+					Config[Index] = Entry
+				end
+			end
+
+			local Success, Result = pcall(HttpService.JSONEncode, HttpService, Config)
 
 			if not Success then
-				warn("Failed to get config:\n"..Result)
+				warn("[jarvis] failed to get config: " .. tostring(Result))
 				return
 			end
 
-			return HttpService:JSONEncode(Config)
+			return Result
 		end
 
+		-- returns Success, FailedCount (or the reason when the file itself is unreadable)
+		-- order matters: preset -> theme colours -> keybinds and colourpickers -> everything else, so a keybind
+		-- callback can never overwrite the toggle it drives with a stale value
 		Library.LoadConfig = function(Self, Config)
-			local Decoded = HttpService:JSONDecode(Config)
+			local Decoded = nil
+			local Ok = pcall(function()
+				Decoded = HttpService:JSONDecode(Config)
+			end)
 
-			local Success, Result = Library:SafeCall(function()
+			if not Ok or type(Decoded) ~= "table" then
+				return false, "not a valid config file"
+			end
+
+			local Failed = { }
+
+			local function Apply(Index, Value)
+				local SetFunction = Library.SetFlags[Index]
+
+				if not SetFunction then
+					return
+				end
+
+				local Success, Error = pcall(function()
+					if type(Value) == "table" and Value.Color then
+						SetFunction(Value.Color, Value.Alpha, Value.Animate, Value.Mode)
+					else
+						SetFunction(Value)
+					end
+				end)
+
+				if not Success then
+					table.insert(Failed, tostring(Index) .. ": " .. tostring(Error))
+				end
+			end
+
+			local Phases = {
+				function(Index) return Index == "theme_preset" end,
+				function(Index) return Library.Theme[Index] ~= nil end,
+				function(Index, Value) return type(Value) == "table" and (Value.Key ~= nil or Value.Color ~= nil) end,
+				function() return true end
+			}
+
+			local Done = { }
+
+			for _, Match in Phases do
 				for Index, Value in Decoded do
-					local SetFunction = Library.SetFlags[Index]
+					if not Done[Index] and not Library.ConfigExclude[Index] and Match(Index, Value) then
+						Done[Index] = true
 
-					if SetFunction then
-						if type(Value) == "table" and Value.Key then
-							SetFunction(Value)
-						elseif type(Value) == "table" and Value.Color then
-							SetFunction(Value.Color, Value.Alpha)
-						else
-							SetFunction(Value)
+						Apply(Index, Value)
+					end
+				end
+			end
+
+			if #Failed > 0 then
+				warn("[jarvis] " .. #Failed .. " config flag(s) failed to load:\n" .. table.concat(Failed, "\n"))
+			end
+
+			return true, #Failed
+		end
+
+		-- loads a saved theme file and recolours the whole menu
+		Library.LoadTheme = function(Self, Name)
+			local Path = Library.Directory .. Library.Folders.Themes .. "/" .. tostring(Name) .. ".json"
+
+			if not isfile(Path) then
+				return false, "theme file not found"
+			end
+
+			local Decoded = nil
+			local Ok = pcall(function()
+				Decoded = HttpService:JSONDecode(readfile(Path))
+			end)
+
+			if not Ok or type(Decoded) ~= "table" then
+				return false, "not a valid theme file"
+			end
+
+			for Key, Hex in Decoded do
+				if Library.Theme[Key] ~= nil and type(Hex) == "string" then
+					local Good, Color = pcall(Color3.fromHex, Hex)
+
+					if Good then
+						Library.Theme[Key] = Color
+						Library:ChangeTheme(Key, Color)
+
+						local Setter = Library.SetFlags[Key]
+
+						if Setter then
+							pcall(Setter, Color)
 						end
 					end
 				end
-			end)
+			end
 
-			return Success, Result
+			Library.ActiveTheme = {Kind = "File", Name = Name}
+
+			return true
 		end
 
+		-- autoload: remembered in <Directory>/autoload.json as {config = "name", theme = {Kind = "Preset"|"File", Name = "name"}}
+		Library.ActiveTheme = {Kind = "Preset", Name = "Jarvis"}
+
+		Library.ReadAutoload = function(Self)
+			local Path = Library.Directory .. "/autoload.json"
+			local Data = { }
+
+			if isfile(Path) then
+				pcall(function()
+					local Decoded = HttpService:JSONDecode(readfile(Path))
+
+					if type(Decoded) == "table" then
+						Data = Decoded
+					end
+				end)
+			end
+
+			return Data
+		end
+
+		Library.SetAutoload = function(Self, Kind, Value)
+			local Data = Library:ReadAutoload()
+
+			Data[Kind] = Value
+
+			pcall(writefile, Library.Directory .. "/autoload.json", HttpService:JSONEncode(Data))
+		end
+
+		-- runs once while the library loads, before a single element exists: the autoloaded theme (and the theme stored inside
+		-- the autoloaded config) is written into Library.Theme first, so the menu is built in its final colours and never
+		-- shows another theme for a moment
+		Library.PreloadAutoload = function(Self)
+			local Data = Library:ReadAutoload()
+			local Applied = false
+
+			if type(Data.theme) == "table" and Data.theme.Name then
+				local Ok
+
+				if Data.theme.Kind == "File" then
+					Ok = Library:LoadTheme(Data.theme.Name)
+				else
+					Ok = Library:SetTheme(Data.theme.Name)
+				end
+
+				Applied = Applied or Ok == true
+			end
+
+			if type(Data.config) == "string" and Data.config ~= "" then
+				local Path = ConfigsFolder .. Data.config .. ".json"
+
+				if isfile(Path) then
+					local Decoded = nil
+
+					pcall(function()
+						Decoded = HttpService:JSONDecode(readfile(Path))
+					end)
+
+					if type(Decoded) == "table" then
+						if type(Decoded.theme_preset) == "string" and Library.Presets[Decoded.theme_preset] then
+							Library:SetTheme(Decoded.theme_preset)
+							Applied = true
+						end
+
+						for Key in Library.Theme do
+							local Entry = Decoded[Key]
+
+							if type(Entry) == "table" and type(Entry.Color) == "string" then
+								local Good, Color = pcall(Color3.fromHex, Entry.Color)
+
+								if Good then
+									Library:ChangeTheme(Key, Color)
+									Applied = true
+								end
+							end
+						end
+					end
+				end
+			end
+
+			Library.ThemePreloaded = Applied
+		end
+		Library.ApplyAutoload = function(Self)
+			local Data = Library:ReadAutoload()
+
+			-- the theme was already applied while the library loaded (PreloadAutoload), doing it again would only recolour twice
+			if type(Data.theme) == "table" and Data.theme.Name and not Library.ThemePreloaded then
+				if Data.theme.Kind == "File" then
+					Library:LoadTheme(Data.theme.Name)
+				else
+					Library:SetTheme(Data.theme.Name)
+				end
+			end
+
+			Library.ThemePreloaded = false
+
+			if type(Data.config) == "string" and Data.config ~= "" then
+				local Path = ConfigsFolder .. Data.config .. ".json"
+
+				if isfile(Path) then
+					local Success, Result = Library:LoadConfig(readfile(Path))
+
+					if Success then
+						Library:Notification("autoloaded config: " .. Data.config, 3)
+					else
+						Library:Notification("autoload failed: " .. tostring(Result), 4)
+					end
+				else
+					Library:Notification("autoload config not found: " .. Data.config, 4)
+				end
+			end
+
+			return Data
+		end
 		Library.GetConfigsList = function(Self, Element)
 			local List = { }
 			local ReturnList = { }
@@ -1192,6 +1450,22 @@ do
 
 			if Bucket then
 				for _, Entry in Bucket do
+					local Log = Library.TweenLog[Entry.Item]
+
+					if Log then
+						for Position = #Log, 1, -1 do
+							local Running = Log[Position]
+
+							if Running.Properties[Entry.Property] ~= nil then
+								pcall(function()
+									Running.Tween:Cancel()
+								end)
+
+								table.remove(Log, Position)
+							end
+						end
+					end
+
 					Entry.Item[Entry.Property] = Color
 				end
 			end
@@ -1365,7 +1639,7 @@ do
 			})
 		end
 
-		Library.Build = "jarvis-r3"
+		Library.Build = "jarvis-r7"
 
 		Library.Scrollbars = { }
 
@@ -3802,17 +4076,25 @@ do
 					Row:Connect("MouseButton1Down", function()
 						Colorpicker.AnimationMode = Mode
 
-						RefreshAnimationRows()
+						-- picking an effect switches the animation on, otherwise nothing would visibly happen
+						Colorpicker.Animate = true
+
+						Colorpicker:SyncAnimationUi()
 						Colorpicker:UpdateAnimation()
 					end)
 				end
 
 				RefreshAnimationRows()
 
+				function Colorpicker:SyncAnimationUi()
+					Items["AnimateFill"]:Tween({BackgroundTransparency = Colorpicker.Animate and 0 or 1})
+					RefreshAnimationRows()
+				end
+
 				Items["AnimateButton"]:Connect("MouseButton1Down", function()
 					Colorpicker.Animate = not Colorpicker.Animate
 
-					Items["AnimateFill"]:Tween({BackgroundTransparency = Colorpicker.Animate and 0 or 1})
+					Colorpicker:SyncAnimationUi()
 					Colorpicker:UpdateAnimation()
 				end)
 
@@ -3962,7 +4244,10 @@ do
 					Alpha = Colorpicker.Alpha,
 					Color = Colorpicker.Color,
 					HexValue = Colorpicker.HexValue,
-					Transparency = 1 - Colorpicker.Alpha
+					Transparency = 1 - Colorpicker.Alpha,
+					Base = Colorpicker.HexValue,
+					Animate = Colorpicker.Animate,
+					Mode = Colorpicker.AnimationMode
 				}
 
 				if not IsFromAlpha then
@@ -4112,52 +4397,72 @@ do
 					Colorpicker.AnimationThread = nil
 				end
 
+				-- only the theme's accent picker recolours the whole menu
+				local IsAccent = Data.Flag == "Accent"
+
 				if not Colorpicker.Animate then
+					if Colorpicker.WasAnimating then
+						Colorpicker.WasAnimating = false
+
+						if Colorpicker.AccentRainbow then
+							Colorpicker.AccentRainbow = false
+							Library:StopAccentRainbow()
+						end
+
+						-- back to the colour that was actually picked
+						Colorpicker:Update()
+					end
+
 					return
 				end
 
-				local BaseHue, BaseSaturation, BaseValue = Colorpicker.Hue, Colorpicker.Saturation, Colorpicker.Value
+				Colorpicker.WasAnimating = true
 
 				Colorpicker.AnimationThread = task.spawn(function()
-					local Clock = 0
-
 					while Colorpicker.Animate do
-						Clock = Clock + task.wait(1 / math.clamp(Library.AnimationRate or 30, 1, 240))
+						task.wait(1 / math.clamp(Library.AnimationRate or 30, 1, 240))
 
-						local Mode = Colorpicker.AnimationMode
-						local Hue, Saturation, Value = BaseHue, BaseSaturation, BaseValue
-
-						if Mode == "Rainbow" then
-							Hue = Clock % 1
-						elseif Mode == "Fading" then
-							Value = BaseValue * (0.25 + 0.75 * ((math.sin(Clock * math.pi * 2) + 1) / 2))
-						elseif Mode == "Oscillating" then
-							Hue = (BaseHue + 0.12 * math.sin(Clock * math.pi * 2)) % 1
-						elseif Mode == "Sawtooth" then
-							Value = BaseValue * (0.2 + 0.8 * (Clock % 1))
-						elseif Mode == "Strobe" then
-							Value = (math.floor(Clock * 8) % 2 == 0) and BaseValue or BaseValue * 0.1
+						if not Colorpicker.Animate then
+							break
 						end
 
-						Colorpicker.Hue, Colorpicker.Saturation, Colorpicker.Value = Hue, Saturation, Value
-						Colorpicker.Color = Color3.fromHSV(Hue, Saturation, Value)
+						local Clock = Library.Clock
+						local Mode = Colorpicker.AnimationMode
+						local Button = Items["ColorpickerButton"].Instance
 
-						Items["ColorpickerButton"].Instance.BackgroundColor3 = Colorpicker.Color
+						-- the picked colour stays untouched in Hue / Saturation / Value, the animation only reads it
+						local Hue, Saturation, Value = Colorpicker.Hue, Colorpicker.Saturation, Colorpicker.Value
+						local Animated
 
-						if Colorpicker.IsOpen then
-							Colorpicker.HexValue = Colorpicker.Color:ToHex()
-
-							Items["CurrentColor"].Instance.BackgroundColor3 = Colorpicker.Color
-							Items["Palette"].Instance.BackgroundColor3 = Color3.fromHSV(Hue, 1, 1)
-							Items["Alpha"].Instance.BackgroundColor3 = Colorpicker.Color
-
-							local Sweep = nil
-
-							if Mode == "Rainbow" or Mode == "Oscillating" then
-								Sweep = Hue
+						if Mode == "Rainbow" then
+							-- same function and clock as the title: the swatch shows the colour of the title letter above it
+							Animated = Library:RainbowColor(Library:RainbowPosition(Button.AbsolutePosition.X + Button.AbsoluteSize.X / 2))
+							Hue = Animated:ToHSV()
+						else
+							if Mode == "Fading" then
+								Value = math.max(Value, 0.35) * (0.25 + 0.75 * ((math.sin(Clock * math.pi * 2) + 1) / 2))
+							elseif Mode == "Oscillating" then
+								Saturation = math.max(Saturation, 0.6)
+								Hue = (Hue + 0.12 * math.sin(Clock * math.pi * 2)) % 1
+							elseif Mode == "Sawtooth" then
+								Value = math.max(Value, 0.35) * (0.2 + 0.8 * (Clock % 1))
+							elseif Mode == "Strobe" then
+								Value = (math.floor(Clock * 8) % 2 == 0) and math.max(Value, 0.35) or 0.05
 							end
 
-							Colorpicker:UpdateDraggers(Sweep)
+							Animated = Color3.fromHSV(Hue, Saturation, Value)
+						end
+
+						Colorpicker.Color = Animated
+						Colorpicker.HexValue = Animated:ToHex()
+
+						Button.BackgroundColor3 = Animated
+
+						if Colorpicker.IsOpen then
+							Items["CurrentColor"].Instance.BackgroundColor3 = Animated
+							Items["Palette"].Instance.BackgroundColor3 = Color3.fromHSV(Hue, 1, 1)
+							Items["Alpha"].Instance.BackgroundColor3 = Animated
+
 							Colorpicker:UpdateReadouts()
 						end
 
@@ -4169,19 +4474,32 @@ do
 						end
 
 						FlagTable.Alpha = Colorpicker.Alpha
-						FlagTable.Color = Colorpicker.Color
+						FlagTable.Color = Animated
 						FlagTable.HexValue = Colorpicker.HexValue
 						FlagTable.Transparency = 1 - Colorpicker.Alpha
+						FlagTable.Base = Color3.fromHSV(Colorpicker.Hue, Colorpicker.Saturation, Colorpicker.Value):ToHex()
+						FlagTable.Animate = true
+						FlagTable.Mode = Mode
 
-						if Data.Callback then
-							Library:SafeCall(Data.Callback, Colorpicker.Color, Colorpicker.Alpha)
+						if IsAccent and Mode == "Rainbow" then
+							-- spatial rainbow over every accent element, the theme's own accent colour stays what the user picked
+							Colorpicker.AccentRainbow = true
+							Library:ApplyAccentRainbow()
+						else
+							if Colorpicker.AccentRainbow then
+								Colorpicker.AccentRainbow = false
+								Library:StopAccentRainbow()
+							end
+
+							if Data.Callback then
+								Library:SafeCall(Data.Callback, Animated, Colorpicker.Alpha)
+							end
 						end
 					end
 
 					Colorpicker.AnimationThread = nil
 				end)
 			end
-
 			Items["ColorpickerButton"]:Connect("MouseButton1Down", function()
 				Colorpicker:SetOpen(not Colorpicker.IsOpen)
 			end)
@@ -4273,8 +4591,19 @@ do
 				Colorpicker:Set(Data.Default, Data.Alpha)
 			end
 
-			SetFlags[Colorpicker.Flag] = function(Value, Alpha)
+			SetFlags[Colorpicker.Flag] = function(Value, Alpha, Animate, Mode)
 				Colorpicker:Set(Value, Alpha)
+
+				if Mode then
+					Colorpicker.AnimationMode = Mode
+				end
+
+				if Animate ~= nil then
+					Colorpicker.Animate = Animate == true
+
+					Colorpicker:SyncAnimationUi()
+					Colorpicker:UpdateAnimation()
+				end
 			end
 
 			return Colorpicker, Items
@@ -4719,6 +5048,103 @@ do
 			return Library.OrderCounter
 		end
 
+		-- one clock and one rainbow function drive the title's Rainbow style and every colourpicker rainbow, so they always match.
+		-- positions are measured in title letters: anything sitting over letter 5 of the title gets letter 5's colour
+		Library.Clock = 0
+		Library.RainbowSaturation = 0.6
+		Library.RainbowValue = 1
+
+		Library:Connect(RunService.RenderStepped, function(Delta)
+			Library.Clock += Delta * (Library.TitleAnimation.Speed or 1)
+		end)
+
+		Library.RainbowColor = function(Self, Position)
+			return Color3.fromHSV((Library.Clock * 0.2 - Position * 0.06) % 1, Library.RainbowSaturation, Library.RainbowValue)
+		end
+
+		-- screen x -> title letter position (the letters are laid out from the title's left edge)
+		Library.RainbowPosition = function(Self, X)
+			local Anchor = Library.TitleAnchor
+			local Origin = 0
+			local Width = Library.FontSize * 0.6
+
+			if Anchor and Anchor.Parent then
+				Origin = Anchor.AbsolutePosition.X
+
+				if (Library.TitleLetterCount or 0) > 0 and Anchor.AbsoluteSize.X > 0 then
+					Width = Anchor.AbsoluteSize.X / Library.TitleLetterCount
+				end
+			end
+
+			return (X - Origin) / Width + 0.5
+		end
+
+		-- accent rainbow: every accent-coloured element gets the title's rainbow at its own position.
+		-- wide bars (accent line, slider fill) get a real gradient across their width, the rest a flat colour
+		local AccentSaved = { }
+
+		Library.ApplyAccentRainbow = function(Self)
+			local Index = Library.ThemeIndex or Library.BuildThemeIndex()
+			local Bucket = Index["Accent"]
+
+			if not Bucket then
+				return
+			end
+
+			for _, Entry in Bucket do
+				local Item = Entry.Item
+
+				if not Item or not Item.Parent then
+					continue
+				end
+
+				local Target = Item:IsA("GuiObject") and Item or Item.Parent
+
+				if not Target or not Target:IsA("GuiObject") then
+					continue
+				end
+
+				local Position = Target.AbsolutePosition
+				local Size = Target.AbsoluteSize
+				local Gradient = nil
+
+				if Entry.Property == "BackgroundColor3" and Item:IsA("GuiObject") then
+					Gradient = Item:FindFirstChildOfClass("UIGradient")
+				end
+
+				if Gradient and Gradient.Rotation == 0 and Size.X > 48 then
+					if not AccentSaved[Gradient] then
+						AccentSaved[Gradient] = Gradient.Color
+					end
+
+					local Count = math.clamp(math.floor(Size.X / 24), 3, 16)
+					local Keys = { }
+
+					for Step = 0, Count do
+						local Alpha = Step / Count
+
+						table.insert(Keys, ColorSequenceKeypoint.new(Alpha, Library:RainbowColor(Library:RainbowPosition(Position.X + Size.X * Alpha))))
+					end
+
+					Gradient.Color = ColorSequence.new(Keys)
+					Item.BackgroundColor3 = Color3.new(1, 1, 1)
+				else
+					Item[Entry.Property] = Library:RainbowColor(Library:RainbowPosition(Position.X + Size.X / 2))
+				end
+			end
+		end
+
+		Library.StopAccentRainbow = function(Self)
+			for Gradient, Colors in AccentSaved do
+				pcall(function()
+					Gradient.Color = Colors
+				end)
+			end
+
+			table.clear(AccentSaved)
+
+			Library:ChangeTheme("Accent", Library.Theme["Accent"])
+		end
 		Library.Window = function(Self, Params)
 			Params = Params or { }
 
@@ -4886,70 +5312,12 @@ do
 
 				Library:Shade(Items["Title"])
 
-Items["Icon"] = Library:Create("Frame", {
-    Name = "\0",
-    Parent = Items["Title"].Instance,
-    AnchorPoint = Vector2.new(0, 0.5),
-    Position = UDim2.new(0, 8, 0.5, 0),
-    Size = UDim2.new(0, 22, 0, 22),
-    ZIndex = 3,
-    BorderSizePixel = 0,
-    BackgroundTransparency = 1
-})
-
--- Strictly use the file system path
-local iconPath = Library.Directory .. Library.Folders.Assets .. "/ez_icon.png"
-local IconImage = Params.Icon or Params.icon
-
-if not IconImage then
-    if isfile(iconPath) then
-        -- Project Real's getcustomasset expects a relative workspace path
-        local success, asset = pcall(function()
-            return getcustomasset(iconPath)
-        end)
-        
-        if success and asset then
-            IconImage = asset
-            print("[Icon Debug] Loaded custom asset: ", asset)
-        else
-            warn("[Icon Debug] Failed to load custom asset: ", asset)
-        end
-    else
-        warn("[Icon Debug] File not found at: ", iconPath)
-    end
-end
-
--- Fallback to the asset ID if the custom asset fails
-if not IconImage then
-    IconImage = "rbxassetid://77648973135853"
-end
-
--- Render the image
-local IconLabel = Library:Create("ImageLabel", {
-    Name = "\0",
-    Parent = Items["Icon"].Instance,
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromScale(1, 1),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ZIndex = 4,
-    ScaleType = Enum.ScaleType.Fit,
-    Image = tostring(IconImage),
-    ImageColor3 = Library.Theme["Accent"]
-})
-
--- Automatically update when the accent color changes
-IconLabel:AddToTheme({
-    ImageColor3 = "Accent"
-})
-
 				Items["ActualTitle"] = Library:Create("Frame", {
 					Name = "\0",
 					Parent = Items["Title"].Instance,
 					BackgroundTransparency = 1,
 					AnchorPoint = Vector2.new(0, 0.5),
-					Position = UDim2.new(0, 30, 0.5, Library.TitleOffsetY or 0),
+					Position = UDim2.new(0, 9, 0.5, Library.TitleOffsetY or 0),
 					Size = UDim2.new(0, 0, 0, 18),
 					ZIndex = 3,
 					BorderSizePixel = 0,
@@ -5007,6 +5375,9 @@ IconLabel:AddToTheme({
 					end
 
 					TitleLastStyle = nil
+
+					Library.TitleAnchor = Items["ActualTitle"].Instance
+					Library.TitleLetterCount = #TitleLetters
 				end
 
 				BuildTitle(Window.Name)
@@ -5032,7 +5403,7 @@ IconLabel:AddToTheme({
 						return
 					end
 
-					TitleClock += TitleElapsed * (Config.Speed or 1)
+					local TitleClock = Library.Clock
 					TitleElapsed = 0
 
 					local Style = Config.Style
@@ -5064,7 +5435,7 @@ IconLabel:AddToTheme({
 						elseif Style == "Pulse" then
 							Color = Base:Lerp(Accent, (math.sin(TitleClock * 2) + 1) / 2)
 						elseif Style == "Rainbow" then
-							Color = Color3.fromHSV((TitleClock * 0.2 - Index * 0.06) % 1, 0.6, 1)
+							Color = Library:RainbowColor(Index)
 						elseif Style == "Typewriter" then
 							local Shown = math.floor((TitleClock * 4) % (Count + 6))
 
@@ -8038,7 +8409,11 @@ IconLabel:AddToTheme({
 			end
 
 			SetFlags[Slider.Flag] = function(Value)
-				Slider:Set(Value)
+				if Slider.IsRange and type(Value) == "table" then
+					Slider:SetRange(Value.Low or Value[1] or Slider.Min, Value.High or Value[2] or Slider.Max)
+				else
+					Slider:Set(Value)
+				end
 			end
 
 			return setmetatable(Slider, Library)
@@ -8438,19 +8813,24 @@ IconLabel:AddToTheme({
 						return
 					end
 
-					Dropdown.Value = Value
+					Dropdown.Value = table.clone(Value)
 
-					for Index, Value in Value do
-						local OptionData = Dropdown.Options[Value]
+					local Chosen = { }
 
-						if OptionData then
-							OptionData.IsSelected = true
-							OptionData:ToggleState("Active")
-						end
+					for _, Name in Dropdown.Value do
+						Chosen[Name] = true
 					end
 
-					Flags[Dropdown.Flag] = Value
-					Items["Value"].Instance.Text = table.concat(Value, ", ")
+					-- options that are not in the new value have to be switched off too
+					for Name, OptionData in Dropdown.Options do
+						local On = Chosen[Name] == true
+
+						OptionData.IsSelected = On
+						OptionData:ToggleState(On and "Active" or "Inactive")
+					end
+
+					Flags[Dropdown.Flag] = Dropdown.Value
+					Items["Value"].Instance.Text = #Dropdown.Value > 0 and table.concat(Dropdown.Value, ", ") or "....."
 				else
 					if not Dropdown.Options[Value] then
 						return
@@ -8609,6 +8989,8 @@ IconLabel:AddToTheme({
 			end
 
 			function Dropdown:Refresh(List)
+				local Previous = Dropdown.Value
+
 				for Index, Value in Dropdown.Options do
 					Dropdown:Remove(Value.Name)
 				end
@@ -8616,8 +8998,22 @@ IconLabel:AddToTheme({
 				for Index, Value in List do
 					Dropdown:Add(Value)
 				end
-			end
 
+				-- keep the current pick when it is still in the list
+				if not Dropdown.Multi and Previous ~= nil and Previous ~= "" then
+					local Option = Dropdown.Options[Previous]
+
+					if Option then
+						Option.IsSelected = true
+						Option:ToggleState("Active")
+						Items["Value"].Instance.Text = Previous
+					else
+						Dropdown.Value = nil
+						Flags[Dropdown.Flag] = nil
+						Items["Value"].Instance.Text = "....."
+					end
+				end
+			end
 			function Dropdown:SetText(Text)
 				Items["Text"].Instance.Text = tostring(Text)
 			end
@@ -11710,14 +12106,26 @@ IconLabel:AddToTheme({
 			local TargetWindow = (Params and Params.Pages) and Params or Self
 			local SettingsPage = TargetWindow:Page({Name = "Settings"})
 
+			-- stays false while the ui is being built so default values never overwrite the saved autoload
+			local UiReady = false
+			-- true while the settings tab is being built: dropdown defaults fire their callbacks and must not touch the theme
+			local Building = true
+
 			local ConfigsSection = SettingsPage:Section({Name = "Configuration", Side = 1}) do
-				local ConfigsDropdown = ConfigsSection:Dropdown({
+				local ConfigsDropdown
+
+				ConfigsDropdown = ConfigsSection:Dropdown({
 					Name = "Configs",
 					Flag = "configs_dropdown",
 					Items = { },
 					Multi = false,
 					Callback = function(Value)
 						ConfigSelected = Value
+
+						-- while autoload is on it follows the selected config
+						if UiReady and Value and Flags["config_autoload"] then
+							Library:SetAutoload("config", Value)
+						end
 					end
 				})
 
@@ -11734,7 +12142,7 @@ IconLabel:AddToTheme({
 					Name = "\0",
 					Parent = ConfigsSection.Items["Content"].Instance,
 					BackgroundTransparency = 1,
-					Size = UDim2.new(1, 0, 0, 46),
+					Size = UDim2.new(1, 0, 0, 48),
 					BorderSizePixel = 0
 				})
 
@@ -11757,20 +12165,31 @@ IconLabel:AddToTheme({
 
 				GridParent.Items["Content"].Instance.Name = "\0"
 
+				local AutoloadConfig
+
 				local SaveButton = Library:Button({
 					Name = "Save",
 					Parent = GridParent,
 					Callback = function()
-						if ConfigName then
-							if ConfigName == "" then
-								return
-							end
+						local Name = string.gsub(tostring(ConfigName or ""), "[^%w%-_ ]", "")
+						Name = string.gsub(Name, "^%s*(.-)%s*$", "%1")
 
-							writefile(ConfigsFolder .. ConfigName .. ".json", Library:GetConfig())
-							Library:GetConfigsList(ConfigsDropdown)
-
-							Library:Notification{Name = "created config succesfully", Time = 3}
+						if Name == "" then
+							Library:Notification("type a config name first", 3)
+							return
 						end
+
+						local Config = Library:GetConfig()
+
+						if not Config then
+							Library:Notification("failed to read the flags, see the console", 4)
+							return
+						end
+
+						writefile(ConfigsFolder .. Name .. ".json", Config)
+						Library:GetConfigsList(ConfigsDropdown)
+
+						Library:Notification("saved config: " .. Name, 3)
 					end
 				})
 
@@ -11778,17 +12197,27 @@ IconLabel:AddToTheme({
 					Name = "Load",
 					Parent = GridParent,
 					Callback = function()
-						if ConfigSelected then
-							if isfile(ConfigsFolder .. ConfigSelected .. ".json") then
-								local ConfigContent = readfile(ConfigsFolder .. ConfigSelected .. ".json")
-								local Success, Error = Library:LoadConfig(ConfigContent)
+						if not ConfigSelected or ConfigSelected == "" then
+							Library:Notification("pick a config first", 3)
+							return
+						end
 
-								if Success then
-									Library:Notification{Name = "loaded config succesfully", Time = 3}
-								else
-									Library:Notification{Name = "failed to load config: ".. Error, Time = 3}
-								end
-							end
+						local Path = ConfigsFolder .. ConfigSelected .. ".json"
+
+						if not isfile(Path) then
+							Library:Notification("config file is missing", 3)
+							Library:GetConfigsList(ConfigsDropdown)
+							return
+						end
+
+						local Success, Result = Library:LoadConfig(readfile(Path))
+
+						if not Success then
+							Library:Notification("failed to load config: " .. tostring(Result), 4)
+						elseif Result > 0 then
+							Library:Notification("loaded " .. ConfigSelected .. " (" .. Result .. " flags failed, see console)", 4)
+						else
+							Library:Notification("loaded config: " .. ConfigSelected, 3)
 						end
 					end
 				})
@@ -11797,13 +12226,25 @@ IconLabel:AddToTheme({
 					Name = "Delete",
 					Parent = GridParent,
 					Callback = function()
-						if ConfigSelected then
-							if isfile(ConfigsFolder .. ConfigSelected .. ".json") then
-								delfile(ConfigsFolder .. ConfigSelected .. ".json")
-								Library:GetConfigsList(ConfigsDropdown)
+						if not ConfigSelected or ConfigSelected == "" then
+							return
+						end
 
-								Library:Notification{Name = "deleted config succesfully", Time = 3}
+						local Path = ConfigsFolder .. ConfigSelected .. ".json"
+
+						if isfile(Path) then
+							delfile(Path)
+
+							-- a deleted config cannot stay the autoload one
+							if Library:ReadAutoload().config == ConfigSelected then
+								AutoloadConfig:Set(false)
+								Library:SetAutoload("config", nil)
 							end
+
+							Library:Notification("deleted config: " .. ConfigSelected, 3)
+
+							ConfigSelected = nil
+							Library:GetConfigsList(ConfigsDropdown)
 						end
 					end
 				})
@@ -11816,9 +12257,36 @@ IconLabel:AddToTheme({
 					end
 				})
 
-				Library:GetConfigsList(ConfigsDropdown)
-			end
+				AutoloadConfig = ConfigsSection:Toggle({
+					Name = "Autoload Config",
+					Flag = "config_autoload",
+					Default = false,
+					Tooltip = "Loads the selected config by itself the next time jarvis starts.",
+					Callback = function(Value)
+						if not UiReady then
+							return
+						end
 
+						if Value then
+							if ConfigSelected and ConfigSelected ~= "" then
+								Library:SetAutoload("config", ConfigSelected)
+								Library:Notification("autoload: " .. ConfigSelected, 3)
+							else
+								Library:Notification("pick a config first", 3)
+								AutoloadConfig:Set(false)
+							end
+						else
+							Library:SetAutoload("config", nil)
+						end
+					end
+				})
+
+				Library:GetConfigsList(ConfigsDropdown)
+
+				-- the startup pass below needs these two to mirror the saved autoload in the ui
+				SettingsPage.ConfigsDropdown = ConfigsDropdown
+				SettingsPage.AutoloadConfig = AutoloadConfig
+			end
 			local ScriptSection = SettingsPage:Section({Name = "Script", Side = 1}) do
 				ScriptSection:Button({
 					Name = "Unload",
@@ -11960,23 +12428,49 @@ IconLabel:AddToTheme({
 					})
 				end
 
+				local AutoloadTheme
+
+				local function SyncThemeAutoload()
+					if UiReady and Flags["theme_autoload"] then
+						Library:SetAutoload("theme", {Kind = Library.ActiveTheme.Kind, Name = Library.ActiveTheme.Name})
+					end
+				end
+
 				ThemingSection:Dropdown({
 					Name = "Preset",
 					Flag = "theme_preset",
 					Items = Library.PresetOrder,
-					Default = Library.CurrentTheme or "Jarvis",
+					Default = (Library.ActiveTheme.Kind == "Preset") and Library.ActiveTheme.Name or nil,
 					Callback = function(Value)
+						if Building then
+							return
+						end
+
 						Library:SetTheme(Value)
+						SyncThemeAutoload()
 					end
 				})
 
-				local ThemesDropdown = ThemingSection:Dropdown({
+				local ThemesDropdown
+
+				ThemesDropdown = ThemingSection:Dropdown({
 					Name = "Themes",
 					Flag = "themes_dropdown",
 					Items = { },
 					Multi = false,
 					Callback = function(Value)
 						ThemeSelected = Value
+
+						-- picking a saved theme applies it right away
+						if UiReady and Value and Value ~= "" then
+							local Success, Result = Library:LoadTheme(Value)
+
+							if Success then
+								SyncThemeAutoload()
+							else
+								Library:Notification("failed to load theme: " .. tostring(Result), 4)
+							end
+						end
 					end
 				})
 
@@ -11993,7 +12487,7 @@ IconLabel:AddToTheme({
 					Name = "\0",
 					Parent = ThemingSection.Items["Content"].Instance,
 					BackgroundTransparency = 1,
-					Size = UDim2.new(1, 0, 0, 46),
+					Size = UDim2.new(1, 0, 0, 48),
 					BorderSizePixel = 0
 				})
 
@@ -12020,18 +12514,24 @@ IconLabel:AddToTheme({
 					Name = "Save",
 					Parent = ThemeGridParent,
 					Callback = function()
-						if ThemeName and ThemeName ~= "" then
-							local ThemeSave = { }
+						local Name = string.gsub(tostring(ThemeName or ""), "[^%w%-_ ]", "")
+						Name = string.gsub(Name, "^%s*(.-)%s*$", "%1")
 
-							for ThemeIndex, ThemeValue in Library.Theme do
-								ThemeSave[ThemeIndex] = "#" .. ThemeValue:ToHex()
-							end
-
-							writefile(Library.Directory .. Library.Folders.Themes .. "/" .. ThemeName .. ".json", HttpService:JSONEncode(ThemeSave))
-							Library:GetThemesList(ThemesDropdown)
-
-							Library:Notification{Name = "saved theme succesfully", Time = 3}
+						if Name == "" then
+							Library:Notification("type a theme name first", 3)
+							return
 						end
+
+						local ThemeSave = { }
+
+						for ThemeIndex, ThemeValue in Library.Theme do
+							ThemeSave[ThemeIndex] = "#" .. ThemeValue:ToHex()
+						end
+
+						writefile(Library.Directory .. Library.Folders.Themes .. "/" .. Name .. ".json", HttpService:JSONEncode(ThemeSave))
+						Library:GetThemesList(ThemesDropdown)
+
+						Library:Notification("saved theme: " .. Name, 3)
 					end
 				})
 
@@ -12039,27 +12539,18 @@ IconLabel:AddToTheme({
 					Name = "Load",
 					Parent = ThemeGridParent,
 					Callback = function()
-						if ThemeSelected then
-							if isfile(Library.Directory .. Library.Folders.Themes .. "/" .. ThemeSelected .. ".json") then
-								local Success, Error = Library:SafeCall(function()
-									local Decoded = HttpService:JSONDecode(readfile(Library.Directory .. Library.Folders.Themes .. "/" .. ThemeSelected .. ".json"))
+						if not ThemeSelected or ThemeSelected == "" then
+							Library:Notification("pick a theme first", 3)
+							return
+						end
 
-									for ThemeIndex, ThemeValue in Decoded do
-										if Library.Theme[ThemeIndex] then
-											local Color = Color3.fromHex(ThemeValue)
-											Library.Theme[ThemeIndex] = Color
-											Library:ChangeTheme(ThemeIndex, Color)
-											SetFlags[ThemeIndex](Color)
-										end
-									end
-								end)
+						local Success, Result = Library:LoadTheme(ThemeSelected)
 
-								if Success then
-									Library:Notification{Name = "loaded theme succesfully", Time = 3}
-								else
-									Library:Notification{Name = "failed to load theme: ".. Error, Time = 3}
-								end
-							end
+						if Success then
+							SyncThemeAutoload()
+							Library:Notification("loaded theme: " .. ThemeSelected, 3)
+						else
+							Library:Notification("failed to load theme: " .. tostring(Result), 4)
 						end
 					end
 				})
@@ -12068,13 +12559,26 @@ IconLabel:AddToTheme({
 					Name = "Delete",
 					Parent = ThemeGridParent,
 					Callback = function()
-						if ThemeSelected then
-							if isfile(Library.Directory .. Library.Folders.Themes .. "/" .. ThemeSelected .. ".json") then
-								delfile(Library.Directory .. Library.Folders.Themes .. "/" .. ThemeSelected .. ".json")
-								Library:GetThemesList(ThemesDropdown)
+						if not ThemeSelected or ThemeSelected == "" then
+							return
+						end
 
-								Library:Notification{Name = "deleted theme succesfully", Time = 3}
+						local Path = Library.Directory .. Library.Folders.Themes .. "/" .. ThemeSelected .. ".json"
+
+						if isfile(Path) then
+							delfile(Path)
+
+							local Saved = Library:ReadAutoload().theme
+
+							if type(Saved) == "table" and Saved.Kind == "File" and Saved.Name == ThemeSelected then
+								AutoloadTheme:Set(false)
+								Library:SetAutoload("theme", nil)
 							end
+
+							Library:Notification("deleted theme: " .. ThemeSelected, 3)
+
+							ThemeSelected = nil
+							Library:GetThemesList(ThemesDropdown)
 						end
 					end
 				})
@@ -12087,8 +12591,48 @@ IconLabel:AddToTheme({
 					end
 				})
 
+				AutoloadTheme = ThemingSection:Toggle({
+					Name = "Autoload Theme",
+					Flag = "theme_autoload",
+					Default = false,
+					Tooltip = "Applies the theme you last picked (preset or saved) by itself the next time jarvis starts.",
+					Callback = function(Value)
+						if not UiReady then
+							return
+						end
+
+						if Value then
+							Library:SetAutoload("theme", {Kind = Library.ActiveTheme.Kind, Name = Library.ActiveTheme.Name})
+							Library:Notification("autoload theme: " .. tostring(Library.ActiveTheme.Name), 3)
+						else
+							Library:SetAutoload("theme", nil)
+						end
+					end
+				})
+
 				Library:GetThemesList(ThemesDropdown)
+
+				-- startup pass: apply the saved autoload, mirror it in the ui, then start listening to the toggles.
+				-- it is deferred so everything the script builds after Library:Init() in the same run is already there.
+				task.defer(function()
+					local Data = Library:ApplyAutoload()
+
+					if type(Data.config) == "string" and SettingsPage.ConfigsDropdown then
+						SettingsPage.ConfigsDropdown:Set(Data.config)
+						SettingsPage.AutoloadConfig:Set(true)
+					end
+
+					if type(Data.theme) == "table" then
+						AutoloadTheme:Set(true)
+					end
+
+					task.defer(function()
+						UiReady = true
+					end)
+				end)
 			end
+
+			Building = false
 
 			return SettingsPage
 		end
@@ -12106,6 +12650,10 @@ Library.Init = function(Self, Params)
 
 	return Library.InitSettings(Library.MainWindow, Params)
 end
+
+pcall(function()
+	Library:PreloadAutoload()
+end)
 
 print("[jarvis] loaded build " .. tostring(Library.Build))
 
